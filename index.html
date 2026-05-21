@@ -169,7 +169,10 @@
       <div id="cards"></div>
     </div>
 
-    <div class="toolbar"><button id="clearBtn">Clear board</button></div>
+    <div class="toolbar">
+      <button id="clearBtn">Clear board</button>
+      <button id="newBtn">New random board</button>
+    </div>
 
     <div class="legend">
       <div>Set the prizes in play, mark tiles as you flip them, and the board re-solves itself — telling you the best tile to flip next.</div>
@@ -258,13 +261,44 @@ function cellsAt(w, h, r0, c0){
   return cs;
 }
 
-// ---- prize cards (seeded with random shapes + counts so each reload differs) ----
+// ---- board persistence (localStorage so a refresh/revisit keeps the board) ----
+const STORAGE_KEY = "treasureHunt.board";
+function randomSlots(){
+  const shapes = [...SHAPES].sort(() => Math.random() - 0.5);
+  return [0,1,2].map(k => ({
+    shape: shapes[k],
+    count: 1 + Math.floor(Math.random() * 2),   // 1..2 (3 can yield impossible boards)
+  }));
+}
+function loadSaved(){
+  try {
+    const d = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (d && Array.isArray(d.slots) && d.slots.length === 3
+        && Array.isArray(d.state) && d.state.length === NCELLS) return d;
+  } catch (e) {}
+  return null;
+}
+function saveBoard(){
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      slots: slotEls.map(s => ({ shape: s.shape, count: s.count })),
+      state: Array.from(state),
+      placedPrizes: placedPrizes.map(p => ({ shape: p.shape, cells: p.cells })),
+    }));
+  } catch (e) {}
+}
+
+// ---- prize cards (restored from a saved board, or random on a clean load) ----
 const cardsEl = document.getElementById("cards");
-const seedShapes = [...SHAPES].sort(() => Math.random() - 0.5);
-const slotEls = [0,1,2].map(k => ({
-  shape: seedShapes[k],
-  count: 1 + Math.floor(Math.random() * 2),   // 1..2 (3 can yield impossible boards)
+const saved = loadSaved();
+const slotEls = (saved ? saved.slots : randomSlots()).map(sl => ({
+  shape: sl.shape, count: sl.count,
 }));
+if (saved){
+  for (let i = 0; i < NCELLS; i++) state[i] = saved.state[i] | 0;
+  (saved.placedPrizes || []).forEach(p =>
+    placedPrizes.push({ shape: p.shape, cells: p.cells.slice() }));
+}
 slotEls.forEach((sl, idx) => {
   sl.card = document.createElement("div");
   sl.card.className = "prizeCard";
@@ -495,9 +529,9 @@ onmessage=function(ev){
   for(i=0;i<groups.length;i++){
     var g=groups[i];
     g.placements=placementsFor(g.shape,missLo,missHi);
-    // shuffle so a timed-out partial enumeration is spatially unbiased
-    // (a completed count is order-independent; symmetry breaking only needs
-    //  a fixed order per solve, not a lexicographic one)
+    // shuffle each shape's placement list per solve: a completed count is
+    // order-independent, but an aborted enumeration over-explores the
+    // lexicographically-first (top-left) placements, biasing partial heatmaps
     for(var sh=g.placements.length-1;sh>0;sh--){
       var sj=(Math.random()*(sh+1))|0,st=g.placements[sh];
       g.placements[sh]=g.placements[sj];g.placements[sj]=st;
@@ -596,6 +630,7 @@ function render(){
 // ---- auto-solve ----
 let solveTimer = null;
 function scheduleSolve(){
+  saveBoard();
   clearTimeout(solveTimer);
   solveTimer = setTimeout(doSolve, 130);
 }
@@ -683,6 +718,17 @@ document.getElementById("clearBtn").addEventListener("click", () => {
   scheduleSolve();
 });
 
+document.getElementById("newBtn").addEventListener("click", () => {
+  endPlacing();
+  const fresh = randomSlots();
+  slotEls.forEach((s, i) => { s.shape = fresh[i].shape; s.count = fresh[i].count; });
+  placedPrizes.length = 0;
+  state.fill(0);
+  slotEls.forEach((s, i) => refreshSlot(i));
+  scheduleSolve();
+});
+
+saveBoard();   // persist the freshly seeded board so a refresh keeps it
 doSolve();
 </script>
 </body>

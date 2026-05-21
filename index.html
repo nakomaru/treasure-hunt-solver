@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Treasure Hunt Solver</title>
+<style>
+  :root {
+    --bg: #11151c;
+    --panel: #1b212c;
+    --line: #2c3543;
+    --text: #e6e9ef;
+    --muted: #93a0b3;
+    --accent: #4da3ff;
+    --gold: #caa44e;
+    --green: #5ad28c;
+    --red: #d9697f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+    -webkit-text-size-adjust: 100%;
+  }
+  h1 { font-size: 18px; margin: 0 0 6px; }
+  .col { max-width: 620px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 9px 16px 16px;
+    margin-top: 10px;
+  }
+  .panel-title { font-size: 14px; font-weight: 700; margin-bottom: 10px; }
+
+  /* status */
+  /* fixed heights so messages never shift the layout below them */
+  #status { font-size: 13px; height: 22px; line-height: 1.45; margin-bottom: 0; overflow: hidden; }
+  #recs { font-size: 13px; height: 24px; margin-bottom: 10px; white-space: nowrap; overflow: hidden; }
+  .pill {
+    display: inline-block; background: #233; border: 1px solid var(--line);
+    border-radius: 5px; padding: 2px 7px; margin: 2px; font-size: 12px;
+  }
+  .warn { color: var(--gold); }
+  .err  { color: var(--red); }
+  .ok   { color: var(--green); }
+
+  /* grid */
+  #grid {
+    display: grid;
+    grid-template-columns: 22px repeat(9, 1fr);
+    gap: 4px;
+    width: min(620px, 95vw);
+    touch-action: none;
+  }
+  .hdr {
+    color: var(--muted); font-size: 11px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .cell {
+    aspect-ratio: 1;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: #232b38;
+    cursor: pointer;
+    position: relative;
+    display: flex; align-items: center; justify-content: center;
+    user-select: none;
+    touch-action: none;
+    transition: background .08s;
+  }
+  .cell.miss { background: #2a1d22 !important; }
+  .cell.miss::after { content: "✕"; color: var(--red); font-size: 22px; }
+  .cell.hit  { background: #3a2f12 !important; }
+  .cell.hit::after { content: "●"; color: #f0c64a; font-size: 20px; }
+  .cell.placed { background: #173a2f !important; }
+  .cell.placed::after { content: "✓"; color: var(--green); font-size: 22px; }
+  .cell .ev { font-size: 14px; font-weight: 700; }
+  /* best pick — chunky white outline */
+  .cell.best { outline: 4px solid #fff; outline-offset: -4px; }
+  .cell.best .star { position: absolute; top: 1px; right: 3px; font-size: 11px; color: #fff; }
+  /* cursor / placement highlights — declared after .best so they override it */
+  .cell:hover { outline: 3px solid var(--green); outline-offset: -3px; }
+  .cell.ghost    { background: var(--accent) !important; }
+  .cell.ghostbad { background: var(--red) !important; }
+
+  /* prize cards */
+  #cards { display: flex; gap: 12px; flex-wrap: wrap; }
+  .prizeCard {
+    flex: 1 1 175px; min-width: 175px;
+    background: #232b38; border: 1px solid var(--line);
+    border-radius: 9px; padding: 10px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .prizeShapes { display: flex; gap: 8px; }
+  .dragShape {
+    flex: 1; height: 52px;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--line); border-radius: 7px;
+    background: #1b212c; cursor: grab;
+    touch-action: none; user-select: none;
+  }
+  .dragShape:hover { border-color: var(--accent); }
+  .dragShape.armed { border-color: var(--accent); background: #26344a; }
+  .dragShape.disabled { opacity: .3; cursor: default; }
+  .chip {
+    background: #1b212c; color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px;
+    font-size: 13px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+  }
+  .chip:hover { border-color: var(--accent); }
+  .shapeChip { width: 100%; height: 38px; }
+  .countGrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .countBtn {
+    background: #1b212c; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    height: 34px; font-size: 13px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .countBtn:hover { border-color: var(--accent); }
+  .countBtn.sel { background: var(--accent); color: #06121f; border-color: var(--accent); font-weight: 700; }
+  .mini { display: grid; gap: 2px; }
+  .mini div { border-radius: 1px; }
+
+  /* popup (shape picker) */
+  .popup {
+    position: absolute; z-index: 50;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.55);
+  }
+  .shapeGrid { display: flex; flex-wrap: wrap; gap: 7px; width: 214px; }
+  .shapeOpt {
+    width: 60px; background: #232b38;
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 9px 4px; cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+  }
+  .shapeOpt:hover { border-color: var(--accent); }
+  .shapeOpt.sel { border-color: var(--accent); background: #26344a; }
+  .shapeOpt.disabled { opacity: .4; }
+  .shapeOpt .cap { font-size: 11px; color: var(--muted); }
+
+  button {
+    background: #2c3543; color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  .toolbar { margin: 14px 0; }
+  .legend { font-size: 12px; color: var(--muted); line-height: 1.7; }
+  .legend b { color: var(--text); }
+</style>
+</head>
+<body>
+  <h1>Treasure Hunt Solver</h1>
+
+  <div class="col">
+    <div id="status"></div>
+    <div id="recs"></div>
+    <div id="grid"></div>
+
+    <div class="panel">
+      <div class="panel-title">Prizes still in play</div>
+      <div id="cards"></div>
+    </div>
+
+    <div class="toolbar"><button id="clearBtn">Clear board</button></div>
+
+    <div class="legend">
+      <div>Set the prizes in play, mark tiles as you flip them, and the board re-solves itself — telling you the best tile to flip next.</div>
+      <div>Flipped an empty tile? <b>Left-click</b> it to mark it <span style="color:#d9697f">Miss&nbsp;✕</span>.</div>
+      <div>Found a prize? <b>Click or drag</b> its shape from the prize card onto the board. It snaps in as <span style="color:#5ad28c">✓</span>, correcting any marks underneath, and updates the count. Click a ✓ tile to undo.</div>
+      <div><b>Double-click or right-click</b> a tile to mark it <span style="color:#f0c64a">Hit&nbsp;●</span> — for when you've uncovered a prize but aren't sure of its adjacent tiles.</div>
+      <div>Each tile shows its <b>chance of hiding a prize</b>. <span style="color:#fff">White outline ★ = best flip.</span></div>
+    </div>
+  </div>
+
+<script>
+const W = 9, H = 5, NCELLS = W * H;
+const SHAPES = ["1x2","1x3","1x4","2x2","2x3","2x4","3x3"];
+const MAX_COUNT = 5;
+
+// ---- state ----
+const state = new Int8Array(NCELLS); // 0 unknown, 1 miss, 2 hit, 3 placed prize
+const placedPrizes = [];             // [{shape, cells:[...]}]
+let placing = null;                  // {slotIdx, w, h} while placing a found prize
+let armedIcon = null;
+let ghost = null, hoverIdx = -1;
+let suppressClick = false;
+let lastResult = null;
+
+// ---- grid ----
+const gridEl = document.getElementById("grid");
+const cells = [];
+function hdr(txt){ const h = document.createElement("div"); h.className = "hdr"; h.textContent = txt; return h; }
+
+gridEl.appendChild(hdr(""));
+for (let c = 0; c < W; c++) gridEl.appendChild(hdr("C" + (c+1)));
+for (let r = 0; r < H; r++){
+  gridEl.appendChild(hdr("R" + (r+1)));
+  for (let c = 0; c < W; c++){
+    const i = r * W + c;
+    const d = document.createElement("div");
+    d.className = "cell";
+    d.dataset.idx = i;
+    d.addEventListener("click", () => {
+      if (suppressClick){ suppressClick = false; return; }
+      if (placing) return;                       // placement commits on pointerup
+      if (state[i] === 3){ removePlacedAt(i); return; }
+      state[i] = (state[i] + 1) % 3;
+      render(); scheduleSolve();
+    });
+    d.addEventListener("contextmenu", e => {
+      e.preventDefault();
+      if (placing){ endPlacing(); return; }
+      if (state[i] === 3){ removePlacedAt(i); return; }
+      state[i] = (state[i] + 2) % 3;
+      render(); scheduleSolve();
+    });
+    gridEl.appendChild(d);
+    cells.push(d);
+  }
+}
+
+// ---- shape helpers ----
+function orientations(sh){
+  const [a,b] = sh.split("x").map(Number);
+  const w = Math.max(a,b), h = Math.min(a,b);   // landscape orientation first
+  return w === h ? [[w,h]] : [[w,h],[h,w]];
+}
+function shapeLabel(sh){                         // display wider dimension first
+  const [a,b] = sh.split("x").map(Number);
+  return Math.max(a,b) + "x" + Math.min(a,b);
+}
+function miniGrid(w, h, px, color){
+  const g = document.createElement("div");
+  g.className = "mini";
+  g.style.gridTemplateColumns = `repeat(${w}, ${px}px)`;
+  for (let k = 0; k < w*h; k++){
+    const c = document.createElement("div");
+    c.style.width = c.style.height = px + "px";
+    c.style.background = color;
+    g.appendChild(c);
+  }
+  return g;
+}
+function cellsAt(w, h, r0, c0){
+  if (c0 < 0 || r0 < 0 || c0 + w > W || r0 + h > H) return null;
+  const cs = [];
+  for (let dr = 0; dr < h; dr++)
+    for (let dc = 0; dc < w; dc++)
+      cs.push((r0+dr)*W + (c0+dc));
+  return cs;
+}
+
+// ---- prize cards (seeded with random shapes + counts so each reload differs) ----
+const cardsEl = document.getElementById("cards");
+const seedShapes = [...SHAPES].sort(() => Math.random() - 0.5);
+const slotEls = [0,1,2].map(k => ({
+  shape: seedShapes[k],
+  count: 1 + Math.floor(Math.random() * 2),   // 1..2 (3 can yield impossible boards)
+}));
+slotEls.forEach((sl, idx) => {
+  sl.card = document.createElement("div");
+  sl.card.className = "prizeCard";
+  cardsEl.appendChild(sl.card);
+  refreshSlot(idx);
+});
+
+function refreshSlot(idx){
+  const sl = slotEls[idx];
+  const card = sl.card;
+  card.innerHTML = "";
+
+  const shapesWrap = document.createElement("div");
+  shapesWrap.className = "prizeShapes";
+  orientations(sl.shape).forEach(([w,h]) => {
+    const ic = document.createElement("div");
+    ic.className = "dragShape" + (sl.count <= 0 ? " disabled" : "");
+    ic.appendChild(miniGrid(w, h, 13, "var(--gold)"));
+    ic.addEventListener("pointerdown", e => {
+      e.preventDefault();
+      if (sl.count <= 0) return;
+      if (placing && placing.slotIdx === idx && placing.w === w && placing.h === h)
+        endPlacing();
+      else
+        startPlacing(idx, w, h, ic);
+    });
+    shapesWrap.appendChild(ic);
+  });
+
+  const shapeChip = document.createElement("button");
+  shapeChip.className = "chip shapeChip";
+  shapeChip.appendChild(miniGrid(...orientations(sl.shape)[0], 6, "#8b97ad"));
+  const tx = document.createElement("span");
+  tx.textContent = shapeLabel(sl.shape);
+  shapeChip.appendChild(tx);
+  shapeChip.addEventListener("click", e => { e.stopPropagation(); openShapePicker(shapeChip, idx); });
+
+  const cg = document.createElement("div");
+  cg.className = "countGrid";
+  for (let n = 0; n <= MAX_COUNT; n++){
+    const b = document.createElement("div");
+    b.className = "countBtn" + (n === sl.count ? " sel" : "");
+    b.textContent = n;
+    b.addEventListener("click", () => {
+      sl.count = n;
+      if (placing && placing.slotIdx === idx && n <= 0) endPlacing();
+      refreshSlot(idx);
+      scheduleSolve();
+    });
+    cg.appendChild(b);
+  }
+
+  card.append(shapesWrap, shapeChip, cg);
+}
+
+// ---- shape picker popup ----
+let activePopup = null;
+function closePopup(){ if (activePopup){ activePopup.remove(); activePopup = null; } }
+document.addEventListener("click", e => {
+  if (activePopup && !activePopup.contains(e.target) && !e.target.closest(".chip"))
+    closePopup();
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape"){ closePopup(); if (placing) endPlacing(); }
+});
+function showPopup(pop, anchor){
+  activePopup = pop;
+  document.body.appendChild(pop);
+  const r = anchor.getBoundingClientRect();
+  let left = window.scrollX + r.left;
+  pop.style.left = left + "px";
+  pop.style.top  = (window.scrollY + r.bottom + 6) + "px";
+  const pr = pop.getBoundingClientRect();
+  if (pr.right > window.innerWidth - 8)
+    pop.style.left = (left - (pr.right - window.innerWidth + 8)) + "px";
+  if (pr.bottom > window.innerHeight - 8)
+    pop.style.top = (window.scrollY + r.top - pr.height - 6) + "px";
+}
+function openShapePicker(anchor, idx){
+  closePopup();
+  const pop = document.createElement("div");
+  pop.className = "popup";
+  const grid = document.createElement("div");
+  grid.className = "shapeGrid";
+  const usedElsewhere = new Set(slotEls.filter((s,i) => i !== idx).map(s => s.shape));
+  SHAPES.forEach(sh => {
+    const opt = document.createElement("div");
+    opt.className = "shapeOpt";
+    if (sh === slotEls[idx].shape) opt.classList.add("sel");
+    else if (usedElsewhere.has(sh)) opt.classList.add("disabled");
+    opt.appendChild(miniGrid(...orientations(sh)[0], 7, "#8b97ad"));
+    const cap = document.createElement("div");
+    cap.className = "cap"; cap.textContent = shapeLabel(sh);
+    opt.appendChild(cap);
+    opt.addEventListener("click", () => {
+      const cur = slotEls[idx];
+      if (sh !== cur.shape){
+        // if another card already holds this shape, swap the two shapes
+        // (counts stay put — the user may have set them first)
+        const other = slotEls.find((s, i) => i !== idx && s.shape === sh);
+        if (other){
+          other.shape = cur.shape;
+          refreshSlot(slotEls.indexOf(other));
+        }
+        cur.shape = sh;
+        refreshSlot(idx);
+        scheduleSolve();
+      }
+      closePopup();
+    });
+    grid.appendChild(opt);
+  });
+  pop.appendChild(grid);
+  showPopup(pop, anchor);
+}
+
+// ---- placing a found prize (drag / tap) ----
+function startPlacing(slotIdx, w, h, iconEl){
+  endPlacing();
+  placing = { slotIdx, w, h };
+  armedIcon = iconEl;
+  iconEl.classList.add("armed");
+  hoverIdx = -1; ghost = null;
+  render();
+}
+function endPlacing(){
+  placing = null; ghost = null; hoverIdx = -1;
+  if (armedIcon){ armedIcon.classList.remove("armed"); armedIcon = null; }
+  render();
+}
+function cellIndexFromPoint(x, y){
+  const el = document.elementFromPoint(x, y);
+  const cell = el && el.closest && el.closest(".cell");
+  return cell ? +cell.dataset.idx : -1;
+}
+function updateGhost(){
+  if (!placing || hoverIdx < 0){ if (ghost){ ghost = null; render(); } return; }
+  const cs = cellsAt(placing.w, placing.h, (hoverIdx/W)|0, hoverIdx%W);
+  ghost = { cells: cs || [], valid: !!cs && cs.every(x => state[x] !== 3) };
+  render();
+}
+document.addEventListener("pointermove", e => {
+  if (!placing) return;
+  const idx = cellIndexFromPoint(e.clientX, e.clientY);
+  if (idx === hoverIdx) return;
+  hoverIdx = idx;
+  updateGhost();
+});
+document.addEventListener("pointerup", e => {
+  if (!placing) return;
+  const idx = cellIndexFromPoint(e.clientX, e.clientY);
+  if (idx >= 0) tryCommitPlace(idx);   // released off-board => stay armed
+});
+
+function tryCommitPlace(i){
+  if (!placing) return;
+  const cs = cellsAt(placing.w, placing.h, (i/W)|0, i%W);
+  if (!cs || !cs.every(x => state[x] !== 3)) return;   // off-grid or over another prize
+  const slot = slotEls[placing.slotIdx];
+  if (!slot || slot.count <= 0) return;
+  cs.forEach(x => state[x] = 3);                       // self-corrects any marks under it
+  placedPrizes.push({ shape: slot.shape, cells: cs });
+  slot.count--;
+  refreshSlot(placing.slotIdx);
+  suppressClick = true;
+  setTimeout(() => { suppressClick = false; }, 0);
+  endPlacing();
+  scheduleSolve();
+}
+function removePlacedAt(i){
+  const idx = placedPrizes.findIndex(p => p.cells.includes(i));
+  if (idx < 0) return;
+  const p = placedPrizes[idx];
+  p.cells.forEach(c => state[c] = 0);
+  placedPrizes.splice(idx, 1);
+  const slot = slotEls.find(s => s.shape === p.shape);
+  if (slot && slot.count < MAX_COUNT){ slot.count++; refreshSlot(slotEls.indexOf(slot)); }
+  render(); scheduleSolve();
+}
+
+// ---- solver (runs in a Web Worker so the UI stays live and updates progressively) ----
+const SOLVE_CAP_MS = 120000;
+const WORKER_SRC = `
+const W=9,H=5,NCELLS=45;
+function orientations(sh){var p=sh.split('x'),a=+p[0],b=+p[1];return a===b?[[a,b]]:[[a,b],[b,a]];}
+function shapeArea(sh){var p=sh.split('x');return p[0]*p[1];}
+function placementsFor(sh,missLo,missHi){
+  var seen={},out=[],ors=orientations(sh);
+  for(var o=0;o<ors.length;o++){
+    var w=ors[o][0],h=ors[o][1];
+    for(var r=0;r<=H-h;r++)for(var c=0;c<=W-w;c++){
+      var lo=0,hi=0,cs=[];
+      for(var dr=0;dr<h;dr++)for(var dc=0;dc<w;dc++){
+        var idx=(r+dr)*W+(c+dc);cs.push(idx);
+        if(idx<32)lo|=(1<<idx);else hi|=(1<<(idx-32));
+      }
+      var key=lo+'_'+hi;
+      if(seen[key])continue;
+      seen[key]=1;
+      if((lo&missLo)||(hi&missHi))continue;
+      out.push({lo:lo,hi:hi,cells:cs});
+    }
+  }
+  return out;
+}
+onmessage=function(ev){
+  var state=ev.data.state,slots=ev.data.slots;
+  var missLo=0,missHi=0,hitLo=0,hitHi=0,i;
+  for(i=0;i<NCELLS;i++){
+    var bL=i<32?(1<<i):0,bH=i>=32?(1<<(i-32)):0;
+    if(state[i]===1||state[i]===3){missLo|=bL;missHi|=bH;}
+    if(state[i]===2){hitLo|=bL;hitHi|=bH;}
+  }
+  var gm={},order=[];
+  for(i=0;i<slots.length;i++){
+    var s=slots[i];if(s.count===0)continue;
+    if(gm[s.shape])gm[s.shape].count+=s.count;
+    else{gm[s.shape]={shape:s.shape,count:s.count};order.push(gm[s.shape]);}
+  }
+  var groups=order.sort(function(a,b){return shapeArea(b.shape)-shapeArea(a.shape);});
+  var accumAny=new Float64Array(NCELLS);
+  var t0=performance.now();
+  function done(total,aborted,leaf){
+    postMessage({type:'done',total:total,accumAny:accumAny,aborted:aborted,leaf:leaf,
+                 ms:Math.round(performance.now()-t0)});
+  }
+  if(groups.length===0){done(0,false,0);return;}
+  for(i=0;i<groups.length;i++){
+    var g=groups[i];
+    g.placements=placementsFor(g.shape,missLo,missHi);
+    var oL=0,oH=0;
+    for(var k=0;k<g.placements.length;k++){oL|=g.placements[k].lo;oH|=g.placements[k].hi;}
+    g.orLo=oL;g.orHi=oH;
+  }
+  var inst=[];
+  for(i=0;i<groups.length;i++)for(var k2=0;k2<groups[i].count;k2++)inst.push(groups[i]);
+  var N=inst.length;
+  if(N===0){done(1,false,1);return;}
+  for(i=0;i<groups.length;i++)if(groups[i].placements.length===0){done(0,false,0);return;}
+  var sameAsPrev=[],plList=[];
+  for(i=0;i<N;i++){sameAsPrev.push(i>0&&inst[i-1]===inst[i]);plList.push(inst[i].placements);}
+  var sufLo=new Array(N+1),sufHi=new Array(N+1);
+  sufLo[N]=0;sufHi[N]=0;
+  for(i=N-1;i>=0;i--){sufLo[i]=sufLo[i+1]|inst[i].orLo;sufHi[i]=sufHi[i+1]|inst[i].orHi;}
+  if((hitLo&~sufLo[0])||(hitHi&~sufHi[0])){done(0,false,0);return;}
+  var nodes=0,leaf=0,aborted=false,lastPost=t0;
+  function rec(i,occLo,occHi,uncLo,uncHi,minIdx){
+    if(i===N){if(uncLo===0&&uncHi===0){leaf++;return 1;}return 0;}
+    if((uncLo&~sufLo[i])||(uncHi&~sufHi[i]))return 0;
+    if((++nodes&131071)===0){
+      var now=performance.now();
+      if(now-t0>SOLVE_CAP)aborted=true;
+      else if(now-lastPost>500){postMessage({type:'progress',accumAny:accumAny,leaf:leaf});lastPost=now;}
+    }
+    if(aborted)return 0;
+    var pls=plList[i],start=sameAsPrev[i]?minIdx:0,count=0;
+    for(var idx=start;idx<pls.length;idx++){
+      var p=pls[idx];
+      if((occLo&p.lo)|(occHi&p.hi))continue;
+      var sub=rec(i+1,occLo|p.lo,occHi|p.hi,uncLo&~p.lo,uncHi&~p.hi,idx+1);
+      if(sub>0){count+=sub;for(var c=0;c<p.cells.length;c++)accumAny[p.cells[c]]+=sub;}
+      if(aborted)break;
+    }
+    return count;
+  }
+  var total=rec(0,0,0,hitLo,hitHi,0);
+  done(aborted?leaf:total,aborted,leaf);
+};
+`.replace("SOLVE_CAP", SOLVE_CAP_MS);
+const workerURL = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" }));
+let worker = null;
+
+// ---- render ----
+function render(){
+  for (let i = 0; i < NCELLS; i++){
+    const el = cells[i];
+    el.className = "cell" +
+      (state[i] === 1 ? " miss" : state[i] === 2 ? " hit" : state[i] === 3 ? " placed" : "");
+    el.innerHTML = "";
+    el.style.background = "";
+  }
+
+  if (lastResult && lastResult.total > 0){
+    const { total, accumAny } = lastResult;
+    let minP = Infinity, maxP = 0;
+    for (let i = 0; i < NCELLS; i++)
+      if (state[i] === 0){
+        const p = accumAny[i] / total;
+        if (p < minP) minP = p;
+        if (p > maxP) maxP = p;
+      }
+    const range = maxP - minP;
+    for (let i = 0; i < NCELLS; i++){
+      if (state[i] !== 0) continue;
+      const el = cells[i];
+      const prob = accumAny[i] / total;
+      // rescale across the actual min..max, then a gamma curve that pushes
+      // all but the strongest tiles toward the dark (gray) end
+      let t = range > 1e-12 ? (prob - minP) / range : (prob > 0 ? 1 : 0);
+      t = Math.pow(t, 2.4);
+      el.style.background = `hsl(40, ${4 + t*52}%, ${27 + t*29}%)`;
+      el.innerHTML = `<div class="ev">${(prob*100).toFixed(1)}%</div>`;
+      if (maxP > 0 && prob >= maxP - 1e-9){
+        el.classList.add("best");
+        el.innerHTML += `<div class="star">★</div>`;
+      }
+    }
+  }
+
+  // placement preview, drawn last so it overrides the heatmap and best outline
+  if (placing && ghost){
+    for (const c of ghost.cells){
+      const el = cells[c];
+      el.classList.remove("best");
+      el.classList.add(ghost.valid ? "ghost" : "ghostbad");
+      el.style.background = "";
+      el.innerHTML = "";
+    }
+  }
+}
+
+// ---- auto-solve ----
+let solveTimer = null;
+function scheduleSolve(){
+  clearTimeout(solveTimer);
+  solveTimer = setTimeout(doSolve, 130);
+}
+function doSolve(){
+  const status = document.getElementById("status");
+  const recs = document.getElementById("recs");
+  recs.innerHTML = "";
+  const totalCount = slotEls.reduce((a,s) => a + s.count, 0);
+
+  if (worker){ worker.terminate(); worker = null; }
+  if (totalCount === 0){
+    lastResult = null;
+    status.innerHTML = `<span style="color:var(--muted)">Set how many of each prize remain to start solving.</span>`;
+    render();
+    return;
+  }
+
+  status.innerHTML = `<span style="color:var(--muted)">Calculating…</span>`;
+  const myWorker = new Worker(workerURL);
+  worker = myWorker;
+  myWorker.onmessage = e => {
+    if (worker !== myWorker) return;
+    const d = e.data;
+    if (d.type === "progress"){
+      applyResult(d.accumAny, d.leaf, { partial: true });
+    } else {
+      worker = null; myWorker.terminate();
+      applyResult(d.accumAny, d.total, { aborted: d.aborted, ms: d.ms });
+    }
+  };
+  myWorker.postMessage({
+    state: Array.from(state),
+    slots: slotEls.map(s => ({ shape: s.shape, count: s.count })),
+  });
+}
+
+function applyResult(accumAny, total, info){
+  const status = document.getElementById("status");
+  const recs = document.getElementById("recs");
+  lastResult = total > 0 ? { total, accumAny } : null;
+  render();
+
+  if (info.partial){
+    status.innerHTML = `<span class="warn">Calculating… ${Number(total).toLocaleString()} boards so far</span>`;
+  } else if (info.aborted){
+    status.innerHTML = `<span class="warn">Time limit hit — estimate from ` +
+      `${Number(total).toLocaleString()} boards; mark more tiles to refine.</span>`;
+  } else if (total <= 0){
+    status.innerHTML = `<span class="err">No arrangement fits — check your tile marks and prize counts.</span>`;
+    recs.innerHTML = "";
+    return;
+  } else {
+    status.innerHTML = `<span class="ok">${total.toLocaleString()}</span> ` +
+      `possible board${total === 1 ? "" : "s"} · solved in ${info.ms} ms`;
+  }
+
+  if (total > 0){
+    const ranked = [];
+    for (let i = 0; i < NCELLS; i++)
+      if (state[i] === 0) ranked.push({ i, p: accumAny[i] / total });
+    ranked.sort((a,b) => b.p - a.p);
+    if (ranked.length){
+      const best = ranked[0].p;
+      const top = ranked.filter(r => r.p >= best - 1e-9);
+      const shown = top.slice(0, 4);
+      let html = "<b>Best flip:</b> " + shown.map(r =>
+        `<span class="pill">R${(r.i/W|0)+1}C${(r.i%W)+1} · ${(r.p*100).toFixed(1)}%</span>`
+      ).join("");
+      if (top.length > shown.length)
+        html += `<span class="pill">+${top.length - shown.length} more</span>`;
+      recs.innerHTML = html;
+    } else recs.innerHTML = "";
+  }
+}
+
+document.getElementById("clearBtn").addEventListener("click", () => {
+  endPlacing();
+  for (const p of placedPrizes){
+    const slot = slotEls.find(s => s.shape === p.shape);
+    if (slot && slot.count < MAX_COUNT) slot.count++;
+  }
+  placedPrizes.length = 0;
+  state.fill(0);
+  slotEls.forEach((s, i) => refreshSlot(i));
+  scheduleSolve();
+});
+
+doSolve();
+</script>
+</body>
+</html>

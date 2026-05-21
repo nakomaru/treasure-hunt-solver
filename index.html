@@ -495,6 +495,13 @@ onmessage=function(ev){
   for(i=0;i<groups.length;i++){
     var g=groups[i];
     g.placements=placementsFor(g.shape,missLo,missHi);
+    // shuffle so a timed-out partial enumeration is spatially unbiased
+    // (a completed count is order-independent; symmetry breaking only needs
+    //  a fixed order per solve, not a lexicographic one)
+    for(var sh=g.placements.length-1;sh>0;sh--){
+      var sj=(Math.random()*(sh+1))|0,st=g.placements[sh];
+      g.placements[sh]=g.placements[sj];g.placements[sj]=st;
+    }
     var oL=0,oH=0;
     for(var k=0;k<g.placements.length;k++){oL|=g.placements[k].lo;oH|=g.placements[k].hi;}
     g.orLo=oL;g.orHi=oH;

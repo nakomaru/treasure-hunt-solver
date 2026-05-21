@@ -20,7 +20,9 @@ of arrangements where a prize covers it.
 ## Using it
 
 1. **Set the prizes in play.** Each prize card takes a shape (tap to pick one)
-   and a count of 0–5. The cards start with a random mix each load.
+   and a count of 0–5. A clean load starts with a random mix and is saved to
+   your browser's local storage from then on, so a refresh or revisit keeps
+   the same board; **New random board** reseeds it at any time.
 2. The board lists the hit chance of each remaining tile. Reveal the highest
    one in game.
 3. If the tile was **empty**, mark it as **Miss ✕** with left click.

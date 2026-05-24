@@ -1480,15 +1480,13 @@ function reportEtaDebug(samples, finalMs, jobSnap){
     '</svg>';
 }
 
-// Display-only smoothing for the partial-progress line:
-//   - EMA on remaining-time ETA so it stops jittering when the live signal pulls
-//     the total up faster than elapsed.
-//   - Monotone-non-decreasing clamp on shown %, so progress never visually
-//     regresses (raw value can dip when totalPred grows mid-solve).
+// Display-only smoothing for the partial-progress line: EMA the total-time
+// prediction (which converges), then derive remaining and % from it. This
+// avoids EMA-lag in the deterministic ms-per-ms countdown and gives a smooth,
+// near-monotone % for free (elapsed is monotone, totalEma drifts slowly).
 // Resets when a new job starts (detected by elapsed going backwards) or on completion.
-let _displayEtaMs = null, _displayPctEma = null, _displayPct = 0, _displayLastElapsed = -1;
-const DISPLAY_ETA_ALPHA = 0.20;
-const DISPLAY_PCT_ALPHA = 0.25;
+let _displayTotalMs = null, _displayLastElapsed = -1;
+const DISPLAY_TOTAL_ALPHA = 0.20;
 function applyResult(accumAny, total, info){
   const left = document.getElementById("statusLeft");
   const right = document.getElementById("statusRight");
@@ -1497,28 +1495,21 @@ function applyResult(accumAny, total, info){
 
   if (info.partial){
     const ch = info.champ;
-    const havePred = ch && ch.predR != null;
-    if (info.elapsed < _displayLastElapsed){ _displayEtaMs = null; _displayPctEma = null; _displayPct = 0; }
+    const haveTotal = ch && ch.totalPred != null && ch.totalPred > 0;
+    if (info.elapsed < _displayLastElapsed){ _displayTotalMs = null; }
     _displayLastElapsed = info.elapsed;
-    const pctRaw = havePred && ch.totalPred > 0
-      ? Math.max(0, Math.min(0.999, info.elapsed / ch.totalPred))
-      : null;
-    if (pctRaw != null){
-      _displayPctEma = _displayPctEma == null
-        ? pctRaw
-        : DISPLAY_PCT_ALPHA * pctRaw + (1 - DISPLAY_PCT_ALPHA) * _displayPctEma;
-      if (_displayPctEma > _displayPct) _displayPct = _displayPctEma;
+    if (haveTotal){
+      _displayTotalMs = _displayTotalMs == null
+        ? ch.totalPred
+        : DISPLAY_TOTAL_ALPHA * ch.totalPred + (1 - DISPLAY_TOTAL_ALPHA) * _displayTotalMs;
     }
-    const pctShown = pctRaw != null ? _displayPct : null;
-    if (havePred){
-      _displayEtaMs = _displayEtaMs == null
-        ? ch.predR
-        : DISPLAY_ETA_ALPHA * ch.predR + (1 - DISPLAY_ETA_ALPHA) * _displayEtaMs;
-    }
+    const havePred = _displayTotalMs != null;
+    const etaMs    = havePred ? Math.max(0, _displayTotalMs - info.elapsed) : null;
+    const pctShown = havePred ? Math.max(0, Math.min(0.999, info.elapsed / _displayTotalMs)) : null;
     const boards = Number(total).toLocaleString();
     const elapsedTxt = fmtDuration(info.elapsed);
     const boardsHtml = `<span style="color:var(--green)">${boards}</span>`;
-    const etaTxt     = havePred ? fmtDuration(_displayEtaMs) : "—";
+    const etaTxt     = havePred ? fmtDuration(etaMs) : "—";
     const pctHtml    = havePred ? `<span style="color:#8cc4ff">${(pctShown*100).toFixed(1)}%</span>` : `<span style="color:var(--muted)">—</span>`;
     if (DEBUG_ETA){
       const pctTxt = (info.avgP * 100).toFixed(1) + "%";
@@ -1530,12 +1521,12 @@ function applyResult(accumAny, total, info){
     }
     right.innerHTML = `<span style="color:var(--gold)">Elapsed: ${elapsedTxt}</span> · <span style="color:var(--green)">ETA: ${etaTxt}</span> · ${pctHtml}`;
   } else if (total <= 0){
-    _displayEtaMs = null; _displayPctEma = null; _displayPct = 0; _displayLastElapsed = -1;
+    _displayTotalMs = null; _displayLastElapsed = -1;
     left.innerHTML = `<span class="err">No arrangement fits — check your tile marks and prize counts.</span>`;
     right.textContent = "";
     return;
   } else {
-    _displayEtaMs = null; _displayPctEma = null; _displayPct = 0; _displayLastElapsed = -1;
+    _displayTotalMs = null; _displayLastElapsed = -1;
     const cachedTag = info.cached ? " (cached)" : "";
     left.innerHTML = `Solved <span style="color:var(--green)">${total.toLocaleString()}</span> ` +
       `board${total === 1 ? "" : "s"} in <span style="color:var(--gold)">${fmtDuration(info.ms)}</span>${cachedTag}`;

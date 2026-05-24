@@ -17,6 +17,11 @@ The solver enumerates every arrangement of the remaining prizes consistent
 with what you've revealed, then counts, for each unflipped tile, the fraction
 of arrangements where a prize covers it.
 
+Slow boards show a live ETA. The prediction starts from a ridge-regression
+prior over board complexity and blends in the running progress signal as it
+becomes informative. Each completed solve is added to a small stratified
+history in local storage so the prediction sharpens with use.
+
 ## Using it
 
 1. **Set the prizes in play.** Each prize card takes a shape (tap to pick one)

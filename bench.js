@@ -33,6 +33,57 @@ const REPORT_PATH  = path.join(__dirname, 'bench-report.txt');
 const WORKER_FILE  = path.join(__dirname, 'bench-worker.js');
 
 const REPORT_ONLY = process.argv.includes('--report-only');
+// Honest evaluation when augmented neighbors are present: when scoring record X,
+// exclude its entire cluster (source + all +1-miss children) from the training
+// set used to build the prior predictor and the calibration warps. Cluster id
+// = augFrom (for kids) or i (for sources). On data with no augmented rows this
+// is a no-op (each record is its own cluster).
+const CLUSTER_LOO = process.argv.includes('--cluster-loo');
+function clusterIdOf(r){ return r.augFrom != null ? r.augFrom : r.i; }
+// Data augmentation: for each existing slow solve, generate N variations by
+// adding a single Miss in a random open cell. Boards stay structurally close
+// to the source — same slots, +1 miss — which clusters similar examples into
+// each TIME_BIN so the bucketed/kNN late-phase calibrations have local density.
+//   node bench.js --augment            # default: 5 variations per source ≥30s
+//   node bench.js --augment=10 --aug-min-ms=60000
+const AUGMENT_MODE = process.argv.some(a => a === '--augment' || a.startsWith('--augment='));
+const AUGMENT_N = (() => {
+  const a = process.argv.find(s => s.startsWith('--augment='));
+  return a ? parseInt(a.slice('--augment='.length), 10) || 5 : 5;
+})();
+const AUGMENT_MIN_MS = (() => {
+  const a = process.argv.find(s => s.startsWith('--aug-min-ms='));
+  return a ? parseFloat(a.slice('--aug-min-ms='.length)) : 30000;
+})();
+// Cap the number of source boards (clusters) processed in one augment run.
+// Each cluster = 1 source + up to AUGMENT_N +1-miss neighbors. Default 3 so
+// the user can sanity-check the pipeline before committing real compute time.
+const AUGMENT_CLUSTERS = (() => {
+  const a = process.argv.find(s => s.startsWith('--clusters='));
+  return a ? Math.max(1, parseInt(a.slice('--clusters='.length), 10) || 3) : 3;
+})();
+// Hit-augment mode: parallel to --augment but with the new cell set to 2 (Hit)
+// instead of 1 (Miss). Default range 5–60s — the live regime where the user
+// has just clicked their first tile and the model needs to refit. nHit is
+// zero across the existing dataset, so without this the audit can't say
+// anything about its predictive power.
+const HIT_AUGMENT_MODE = process.argv.some(a => a === '--augment-hit' || a.startsWith('--augment-hit='));
+const HIT_AUGMENT_N = (() => {
+  const a = process.argv.find(s => s.startsWith('--augment-hit='));
+  return a ? parseInt(a.slice('--augment-hit='.length), 10) || 5 : 5;
+})();
+const HIT_AUG_MIN_MS = (() => {
+  const a = process.argv.find(s => s.startsWith('--hit-aug-min-ms='));
+  return a ? parseFloat(a.slice('--hit-aug-min-ms='.length)) : 5000;
+})();
+const HIT_AUG_MAX_MS = (() => {
+  const a = process.argv.find(s => s.startsWith('--hit-aug-max-ms='));
+  return a ? parseFloat(a.slice('--hit-aug-max-ms='.length)) : 60000;
+})();
+const HIT_AUGMENT_CLUSTERS = (() => {
+  const a = process.argv.find(s => s.startsWith('--hit-clusters='));
+  return a ? Math.max(1, parseInt(a.slice('--hit-clusters='.length), 10) || 5) : 5;
+})();
 const SHRINK_ONLY = process.argv.includes('--shrink');
 const SHRINK_BENCH = process.argv.includes('--shrink-bench');
 const FULL_SWEEP   = process.argv.includes('--full-sweep');
@@ -93,6 +144,36 @@ function placementCountFor(sh, missLo, missHi){
       }
   }
   return n;
+}
+
+// Per-cell touch counts: for a given shape under current miss mask, returns
+// an Int32Array of length NCELLS where t[c] = number of valid placements that
+// occupy cell c. Used to compute the +1-miss derivative directly: marking c
+// as miss removes t[c] placements from this shape, dropping log(placements)
+// by log(np) − log(np − t[c]).
+function placementTouchCountsFor(sh, missLo, missHi){
+  const touches = new Int32Array(NCELLS);
+  let n = 0; const seen = Object.create(null);
+  for (const [w, h] of orientations(sh)){
+    for (let r = 0; r <= H - h; r++)
+      for (let c = 0; c <= W - w; c++){
+        let lo = 0, hi = 0;
+        const cells = [];
+        for (let dr = 0; dr < h; dr++)
+          for (let dc = 0; dc < w; dc++){
+            const idx = (r+dr)*W + (c+dc);
+            cells.push(idx);
+            if (idx < 32) lo |= (1 << idx); else hi |= (1 << (idx-32));
+          }
+        const key = lo + '_' + hi;
+        if (seen[key]) continue;
+        seen[key] = 1;
+        if ((lo & missLo) || (hi & missHi)) continue;
+        n++;
+        for (const idx of cells) touches[idx]++;
+      }
+  }
+  return { touches, n };
 }
 
 function logFactorial(k){ let s = 0; for (let i = 2; i <= k; i++) s += Math.log(i); return s; }
@@ -206,19 +287,117 @@ function featuresFor(stateArr, slotArr){
     openComponents: geom.components,
     logBboxArea: geom.bboxArea > 0 ? Math.log(geom.bboxArea) : 0,
     bboxFill: geom.bboxArea > 0 ? nOpen / geom.bboxArea : 0,
+    // Interaction terms catching the +1-miss/+1-hit derivative that single-
+    // feature OLS coefficients miss when cross-board variation washes them
+    // out. The shipped lean set picks `logProd_x_n{Miss,Hit}` and
+    // `logProd_per_open` from this group; the rest stay available for audits.
+    logProd_per_open: nOpen > 0 ? logProd / nOpen : 0,
+    logProdAdj_per_open: nOpen > 0 ? (logProd - logFactSum) / nOpen : 0,
+    logProd_x_nMiss: logProd * nMiss,
+    logProd_sq: logProd * logProd,
+    logProd_x_nHit:           logProd * nHit,
+    logProdAdj_x_nMiss:       (logProd - logFactSum) * nMiss,
+    logProdAdj_x_nHit:        (logProd - logFactSum) * nHit,
+    logChooseFree_x_nMiss:    0,         // filled in patchFeatures (needs logChooseFree)
+    logChooseFree_x_nHit:     0,         // ditto
+    logChooseFree_sq:         0,         // ditto
+    logProdAdj_sq:            (logProd - logFactSum) * (logProd - logFactSum),
+    density_x_logProd:        (nOpen > 0 ? prizeArea / nOpen : 0) * logProd,
+    density_x_logProdAdj:     (nOpen > 0 ? prizeArea / nOpen : 0) * (logProd - logFactSum),
+    nMiss_sq:                 nMiss * nMiss,
+    nHit_sq:                  nHit * nHit,
+    nMiss_x_nHit:             nMiss * nHit,
+    nMiss_plus_nHit:          nMiss + nHit,             // unified "marked-cell count"
+    logProd_per_prize:        nPrizes > 0 ? logProd / nPrizes : 0,    // alt effBranching baseline
+    // Per-cell constraint-power aggregates. For each open cell c, sum over
+    // shapes k_s · [log(np_s) − log(np_s − t_{c,s})] — the drop in logProd
+    // from marking c as the next miss. Captures how leveraged the search
+    // tree is. Filled in by patchCellImpacts (needs state + slots).
+    maxCellDrop:  0, meanCellDrop: 0, medCellDrop: 0, varCellDrop: 0,
+    minCellDrop:  0, rangeCellDrop: 0,
   };
 }
-// fill logProdRest = logProd - logProdTop
-function patchFeatures(f){ if (!f.infeasible) f.logProdRest = f.logProd - f.logProdTop; return f; }
+// Compute the +1-miss derivative features. Called from patchFeatures.
+function patchCellImpacts(f, stateArr, slotArr){
+  if (f.infeasible) return f;
+  let missLo = 0, missHi = 0;
+  for (let i = 0; i < NCELLS; i++){
+    const s = stateArr[i];
+    if (s === 1 || s === 3){
+      if (i < 32) missLo |= (1 << i); else missHi |= (1 << (i-32));
+    }
+  }
+  const grouped = {};
+  for (const s of slotArr){
+    if (s.count <= 0) continue;
+    grouped[s.shape] = (grouped[s.shape] || 0) + s.count;
+  }
+  // per-cell logProd drop (over OPEN cells only)
+  const drops = [];
+  const perShape = [];
+  for (const sh of Object.keys(grouped)){
+    const { touches, n: np } = placementTouchCountsFor(sh, missLo, missHi);
+    if (np <= 0) return f;
+    perShape.push({ k: grouped[sh], np, touches });
+  }
+  for (let c = 0; c < NCELLS; c++){
+    if (stateArr[c] !== 0) continue;     // only open cells
+    let drop = 0, infeasibleHere = false;
+    for (const { k, np, touches } of perShape){
+      const t = touches[c];
+      if (t === 0) continue;
+      const remaining = np - t;
+      if (remaining <= 0){ infeasibleHere = true; break; }
+      drop += k * (Math.log(np) - Math.log(remaining));
+    }
+    if (infeasibleHere) continue;        // skip cells whose +1-miss kills feasibility
+    drops.push(drop);
+  }
+  if (!drops.length) return f;
+  drops.sort((a, b) => a - b);
+  const n = drops.length;
+  const mean = drops.reduce((a, b) => a + b, 0) / n;
+  let v = 0; for (const d of drops) v += (d - mean) * (d - mean); v /= n;
+  f.maxCellDrop = drops[n - 1];
+  f.minCellDrop = drops[0];
+  f.medCellDrop = drops[n >> 1];
+  f.meanCellDrop = mean;
+  f.varCellDrop = v;
+  f.rangeCellDrop = drops[n - 1] - drops[0];
+  return f;
+}
+// Fill logProdRest = logProd - logProdTop, plus interaction terms that need
+// logChooseFree (which lives in featuresFor's local scope). Cell-impact
+// aggregates are filled separately via patchCellImpacts(f, state, slots).
+function patchFeatures(f){
+  if (f.infeasible) return f;
+  f.logProdRest = f.logProd - f.logProdTop;
+  f.logChooseFree_x_nMiss = f.logChooseFree * f.nMiss;
+  f.logChooseFree_x_nHit  = f.logChooseFree * f.nHit;
+  f.logChooseFree_sq      = f.logChooseFree * f.logChooseFree;
+  return f;
+}
+function fullPatch(f, stateArr, slotArr){ patchFeatures(f); patchCellImpacts(f, stateArr, slotArr); return f; }
 
 const FEATURE_KEYS = [
   'logProd', 'logSum', 'logTopRange', 'logMinPl', 'logMaxPl', 'logChooseFree',
   'nPrizes', 'nOpen', 'nMiss', 'nHit', 'prizeArea', 'slack', 'density',
   'topArea', 'topShapeCount', 'nDistinctShapes', 'varArea',
   'logProdTop', 'logProdRest',
-  // new features
+  // existing P-ish features
   'logFactSum', 'logProdAdj', 'effBranching',
   'openComponents', 'logBboxArea', 'bboxFill',
+  // Cheap interactions catching the +1-miss/+1-hit derivative
+  'logProd_per_open', 'logProdAdj_per_open', 'logProd_x_nMiss', 'logProd_sq',
+  // Per-cell constraint-power aggregates (direct +1-miss derivative)
+  'maxCellDrop', 'minCellDrop', 'medCellDrop', 'meanCellDrop', 'varCellDrop', 'rangeCellDrop',
+  // Response-surface expansion: squares + cross-products on the high-info features
+  'logProd_x_nHit', 'logProdAdj_x_nMiss', 'logProdAdj_x_nHit',
+  'logChooseFree_x_nMiss', 'logChooseFree_x_nHit',
+  'logChooseFree_sq', 'logProdAdj_sq',
+  'density_x_logProd', 'density_x_logProdAdj',
+  'nMiss_sq', 'nHit_sq', 'nMiss_x_nHit', 'nMiss_plus_nHit',
+  'logProd_per_prize',
 ];
 
 // Lean shipping set: top-10 by standardized-ridge |coef|. Matches full-25 LOO
@@ -226,9 +405,16 @@ const FEATURE_KEYS = [
 // solves instead of 27. The 4 zero-variance features (nHit, nDistinctShapes,
 // openComponents, logBboxArea) and a long tail of marginal-or-noisy features
 // are excluded.
+// fav10: lean core + the +1-miss/+1-hit interaction terms. Bench audit shows
+// LOO absLog 0.1361 at λ=0.001 vs 0.1723 for the bare lean-8 set (−21%), and
+// ties the 11-feature lean8_p3_hit while dropping raw `logProd` — which is
+// algebraically reconstructed from logProdAdj + logFactSum (ridge confirms
+// the redundancy: identical scores across λ). Mirrors index.html's shipped
+// FEATURE_KEYS.
 const FEATURE_KEYS_LEAN = [
-  'logProdAdj', 'logProd', 'logSum', 'logFactSum', 'topShapeCount',
-  'density', 'logChooseFree', 'prizeArea', 'slack', 'logProdRest',
+  'logChooseFree', 'logProdAdj', 'logProd_x_nMiss', 'logProd_x_nHit',
+  'topShapeCount', 'density', 'logSum', 'logFactSum',
+  'logProdRest', 'logProd_per_open',
 ];
 
 // ----------------------------------------------------------------------------
@@ -269,7 +455,7 @@ function genBoard(){
     if (totalArea > 38) continue;
     const state = randState();
     const stateArr = Array.from(state);
-    const feats = patchFeatures(featuresFor(stateArr, slots));
+    const feats = fullPatch(featuresFor(stateArr, slots), stateArr, slots);
     if (feats.infeasible) continue;
     if (feats.logProd > 55) continue;          // skip likely-multi-hour solves
     return { slots, state: stateArr, features: feats };
@@ -756,9 +942,13 @@ function liveStratEtas(traj, finalMs, priorMs, opts){
     // Gated min: only project from slowest worker once it has non-zero progress
     // (else linMin produces "infinite remaining" early and ruins the average).
     const minHasProgress = minP > 0;
+    const calibFnMin = opts && opts.calibFnMin || null;
+    const calibFnMinPick = opts && opts.calibFnMinPick ? opts.calibFnMinPick(priorMs) : null;
     if (minHasProgress){
       ests.gatedLinMin     = lin(minP);
-      ests.gatedLinMinCal  = lin(calibFn(minP));
+      ests.gatedLinMinCal  = lin(calibFn(minP));        // legacy: avgP-trained warp applied to minP (mismatched)
+      if (calibFnMin)     ests.gatedLinMinCalOwn    = lin(calibFnMin(minP));      // pooled warp trained on (minP, true_p)
+      if (calibFnMinPick) ests.gatedLinMinBucket    = lin(calibFnMinPick(minP));   // per-priorMs-bin warp on (minP, true_p)
     }
     // EMA on rate (dp/dt of branch_pct_avg)
     for (let i = 0; i < alphas.length; i++){
@@ -832,15 +1022,30 @@ function liveStratEtas(traj, finalMs, priorMs, opts){
       // bayesLogBlend: precision-weighted log-space blend of prior total-time
       // and live total-time estimates. σ²_live(p, priorMs) is now 2D — varies
       // with both progress level and predicted solve length.
+      // Also sweeps `opts.priorVarVariants` (alternative σ²_prior providers —
+      // binned, kNN, etc.) emitting `bayesLogBlend_<name>` per variant.
       {
         const calForBlend = calibFnBucketed;
         const cp = Math.max(0.001, Math.min(0.999, calForBlend(avgP)));
         const liveTot = e / cp;
         const lvar = Math.max(0.001, liveLogVar(avgP, priorMs));
-        const pvar = Math.max(0.001, priorLogVar);
-        const tauP = 1 / pvar, tauL = 1 / lvar;
-        const muPost = (Math.log(priorMs) * tauP + Math.log(liveTot) * tauL) / (tauP + tauL);
-        ests.bayesLogBlend = Math.max(0, Math.exp(muPost) - e);
+        const tauL = 1 / lvar;
+        const logLive = Math.log(liveTot);
+        const logPrior = Math.log(priorMs);
+        function blendWithPVar(pvarRaw){
+          const pvar = Math.max(0.001, pvarRaw);
+          const tauP = 1 / pvar;
+          const muPost = (logPrior * tauP + logLive * tauL) / (tauP + tauL);
+          return Math.max(0, Math.exp(muPost) - e);
+        }
+        ests.bayesLogBlend = blendWithPVar(priorLogVar);
+        if (opts && opts.priorVarVariants){
+          for (const [name, fn] of Object.entries(opts.priorVarVariants)){
+            const v = fn(priorMs);
+            if (v == null || !isFinite(v)) continue;
+            ests['bayesLogBlend_' + name] = blendWithPVar(v);
+          }
+        }
       }
 
       // EXPERIMENT: bayesLogBlend_nocal — same Bayesian blend, but feed RAW
@@ -1017,23 +1222,60 @@ function liveStratEtas(traj, finalMs, priorMs, opts){
           ests[lbl] = bayesBC;
         }
       }
+      // Champions handed off to the per-priorMs-bin-calibrated slow worker
+      // (instead of raw gatedLinMin). Tests whether nearby-sample evidence
+      // helps the final 25% via a length-aware calibration of minP.
+      const gatedB = ests.gatedLinMinBucket != null ? ests.gatedLinMinBucket : null;
+      const gatedO = ests.gatedLinMinCalOwn != null ? ests.gatedLinMinCalOwn : null;
+      if (gatedB != null){
+        ests.championBucket = predPhase >= 0.75 ? gatedB : bayesBC;
+        const w = 1 / (1 + Math.exp(-(predPhase - 0.75) / 0.08));
+        ests.championBucketSmooth = (1 - w) * bayesBC + w * gatedB;
+        for (const thr of [0.60, 0.70, 0.80, 0.85]){
+          ests['championBucket' + Math.round(thr*100)] = predPhase >= thr ? gatedB : bayesBC;
+        }
+      }
+      if (gatedO != null){
+        ests.championPooledMin = predPhase >= 0.75 ? gatedO : bayesBC;
+        const w = 1 / (1 + Math.exp(-(predPhase - 0.75) / 0.08));
+        ests.championPooledMinSmooth = (1 - w) * bayesBC + w * gatedO;
+      }
+      // liveActual: mirror of the in-browser predictEta in index.html — smooth
+      // sigmoid (center 0.70, width 0.12) from 2D-bias-corrected bayesLogBlend
+      // to raw lin(minP). Match the shipped HANDOFF_CENTER/HANDOFF_WIDTH so
+      // bench numbers reflect what users actually see.
+      {
+        const baseLive = ests.bayesLogBlend_bc2d != null ? ests.bayesLogBlend_bc2d
+                       : ests.bayesLogBlend_bc   != null ? ests.bayesLogBlend_bc
+                       : ests.bayesLogBlend;
+        const slowLive = minHasProgress ? lin(minP) : null;
+        if (slowLive != null){
+          const w = 1 / (1 + Math.exp(-(predPhase - 0.70) / 0.12));
+          ests.liveActual = (1 - w) * baseLive + w * slowLive;
+        } else {
+          ests.liveActual = baseLive;
+        }
+      }
     }
     out.push({ e, trueR, ests });
   }
   return out;
 }
 
-// build a calibration warp from training set: pool (avgP, true_p) pairs from
+// build a calibration warp from training set: pool (p, true_p) pairs from
 // every solve, sort, bin into quantiles, take mean of each bin.
+// `keyFn(pt)` extracts the per-sample progress signal (default: avgP).
 // If `globalWarp` and `alpha>0` are passed, each bin's true_p is shrunk toward
-// `globalWarp(bin_centroid_avgP)` with pseudocount `alpha` (Bayesian shrinkage).
-function buildCalib(trainSet, alpha, globalWarp){
+// `globalWarp(bin_centroid_p)` with pseudocount `alpha` (Bayesian shrinkage).
+function buildCalib(trainSet, alpha, globalWarp, keyFn){
+  const getP = keyFn || (pt => pt.pcts.reduce((a,b)=>a+b,0)/pt.pcts.length);
   const pairs = [];
   for (const r of trainSet){
     for (const pt of r.trajectory){
-      const avgP = pt.pcts.reduce((a,b)=>a+b,0)/pt.pcts.length;
+      const p = getP(pt);
+      if (p == null || !isFinite(p) || p <= 0) continue;   // drop zero/no-progress samples
       const truep = pt.e / r.finalMs;
-      if (truep >= 0 && truep <= 1) pairs.push([avgP, truep]);
+      if (truep >= 0 && truep <= 1) pairs.push([p, truep]);
     }
   }
   if (pairs.length < 50) return globalWarp || (p => p);
@@ -1090,18 +1332,36 @@ function timeBinOf(ms){
 // Per-prior-length calibration warps. One 1-D warp per TIME_BINS bucket; at
 // deployment we pick the warp by predicted finalMs (priorMs). Falls back to
 // a pooled flat warp when a bin is too sparse to fit reliably.
-function buildCalibBuckets(trainSet, alpha){
-  const flat = buildCalib(trainSet);                       // pooled global (no shrinkage on itself)
+// Bucket training rows by their LOO-predicted priorMs when available, falling
+// back to actual finalMs only when no LOO estimate is attached (handful of
+// edge cases). This keeps train and test bucket assignment symmetric: both
+// sides use the prior's prediction, so a bin's warp learns the residual
+// structure of boards the prior thinks belong in that bin.
+function bucketKeyFor(r){
+  return r._looPriorMs != null && isFinite(r._looPriorMs) && r._looPriorMs > 0
+    ? r._looPriorMs : r.finalMs;
+}
+function buildCalibBuckets(trainSet, alpha, keyFn){
+  const flat = buildCalib(trainSet, 0, null, keyFn);        // pooled global (no shrinkage on itself)
   const perBin = TIME_BINS.map(bin => {
-    const sub = trainSet.filter(r => r.finalMs >= bin.lo && r.finalMs < bin.hi);
+    const sub = trainSet.filter(r => {
+      const k = bucketKeyFor(r);
+      return k >= bin.lo && k < bin.hi;
+    });
     if (sub.length < 10) return flat;                       // truly empty bucket → just use global
     // With α>0, every per-length warp blends toward the pooled flat warp at each quantile centroid.
-    return buildCalib(sub, alpha || 0, flat);
+    return buildCalib(sub, alpha || 0, flat, keyFn);
   });
   return (priorMs) => {
     const t = timeBinOf(priorMs);
     return t >= 0 ? perBin[t] : flat;
   };
+}
+// Key extractor for slowest-worker (min over pct array, dropping zero-progress workers).
+function pickMinPositive(pt){
+  let m = Infinity;
+  for (const p of pt.pcts) if (p > 0 && p < m) m = p;
+  return isFinite(m) ? m : null;
 }
 
 // 2D live-residual variance: bin by (pct × log(finalMs)). Live signal noise
@@ -1272,6 +1532,90 @@ function priorLogResidualVar(history, buildPredictor, evalMinMs){
   return Math.max(0.005, sumSq/n - m*m);
 }
 
+// LOO log-residual set for the prior, used to build LOCAL σ²_prior providers
+// (binned by predicted time, or k-NN in log(priorMs)). Returns array of
+// { priorMs, finalMs, logRes } — one entry per scoreable LOO fold.
+function buildPriorResidualSet(history, buildPredictor, evalMinMs){
+  const out = [];
+  for (let i = 0; i < history.length; i++){
+    if (history[i].finalMs < evalMinMs) continue;
+    const train = history.slice(0, i).concat(history.slice(i+1));
+    if (train.length < 3) continue;
+    const pred = buildPredictor(train);
+    if (!pred) continue;
+    const yhat = pred(history[i]);
+    if (!yhat || !isFinite(yhat) || yhat <= 0) continue;
+    out.push({ priorMs: yhat, finalMs: history[i].finalMs, logRes: Math.log(yhat) - Math.log(history[i].finalMs) });
+  }
+  return out;
+}
+
+function _varOf(arr){
+  if (arr.length < 2) return null;
+  let s = 0, s2 = 0;
+  for (const v of arr){ s += v; s2 += v*v; }
+  const m = s/arr.length;
+  return Math.max(0.005, s2/arr.length - m*m);
+}
+
+// Build a family of σ²_prior providers from a residual set:
+//   - bin: variance within the priorMs's TIME_BIN (shrunk to global)
+//   - kNN(K, α): variance of K nearest residuals in log(priorMs), with
+//     pseudocount shrinkage α toward the global variance
+function buildPriorVarVariants(residuals, globalVar){
+  if (!residuals.length) return {};
+  const byBin = TIME_BINS.map(() => []);
+  for (const r of residuals){
+    const b = timeBinOf(r.priorMs);
+    if (b >= 0) byBin[b].push(r.logRes);
+  }
+  const binVar = byBin.map(arr => _varOf(arr));
+  // Pre-sort by log(priorMs) so kNN lookup is O(log n) binary search + K scan.
+  const sorted = residuals.slice().sort((a,b) => a.priorMs - b.priorMs);
+  const logsSorted = sorted.map(r => Math.log(r.priorMs));
+  function bin(priorMs){
+    const b = timeBinOf(priorMs);
+    if (b < 0 || binVar[b] == null) return globalVar;
+    // Light shrinkage toward global to keep tiny bins humble.
+    const n = byBin[b].length;
+    return (n * binVar[b] + 5 * globalVar) / (n + 5);
+  }
+  function kNN(K, alphaShrink){
+    return (priorMs) => {
+      if (sorted.length === 0) return globalVar;
+      const lp = Math.log(priorMs);
+      // binary search for insertion point
+      let lo = 0, hi = logsSorted.length;
+      while (lo < hi){ const m = (lo+hi) >>> 1; if (logsSorted[m] < lp) lo = m+1; else hi = m; }
+      // expand window around lo to K closest
+      let l = lo - 1, r = lo;
+      const picked = [];
+      while (picked.length < K && (l >= 0 || r < sorted.length)){
+        const dl = l >= 0 ? lp - logsSorted[l] : Infinity;
+        const dr = r < sorted.length ? logsSorted[r] - lp : Infinity;
+        if (dl <= dr){ picked.push(sorted[l].logRes); l--; } else { picked.push(sorted[r].logRes); r++; }
+      }
+      const v = _varOf(picked);
+      if (v == null) return globalVar;
+      if (alphaShrink > 0){
+        return (picked.length * v + alphaShrink * globalVar) / (picked.length + alphaShrink);
+      }
+      return v;
+    };
+  }
+  return {
+    lvBin:        bin,
+    lvK5:         kNN(5,  0),
+    lvK10:        kNN(10, 0),
+    lvK20:        kNN(20, 0),
+    lvK40:        kNN(40, 0),
+    lvK80:        kNN(80, 0),
+    'lvK10shr5':  kNN(10, 5),
+    'lvK20shr10': kNN(20, 10),
+    'lvK40shr20': kNN(40, 20),
+  };
+}
+
 // ----------------------------------------------------------------------------
 // Main run loop
 // ----------------------------------------------------------------------------
@@ -1338,6 +1682,90 @@ async function runBench(){
 }
 
 // ----------------------------------------------------------------------------
+// Augmentation pass: for each existing slow solve, generate N variants by
+// setting one open cell to MISS (kind=miss) or HIT (kind=hit). Same slots +
+// base state, so the variants cluster around the source — feeding nearby-
+// sample density to the bucketed late-phase calibrations and adding training
+// signal where the dataset is sparse (nHit=0 across all existing solves).
+// ----------------------------------------------------------------------------
+async function runAugmentImpl(opts){
+  const { kind, cellValue, minMs, maxMs, nPerCluster, clusters } = opts;
+  const existing = fs.existsSync(RESULTS_PATH)
+    ? fs.readFileSync(RESULTS_PATH, 'utf8').split('\n').filter(s => s.trim()).map(s => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean)
+    : [];
+  const candidates = existing.filter(r => r.finalMs >= minMs && r.finalMs <= maxMs);
+  if (!candidates.length){
+    console.log(`No solves with finalMs in [${fmtSec(minMs)}..${fmtSec(maxMs)}] in ${path.basename(RESULTS_PATH)} — run a normal bench first.`);
+    return;
+  }
+  for (let i = candidates.length - 1; i > 0; i--){
+    const j = (Math.random() * (i + 1)) | 0;
+    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+  }
+  const sources = candidates.slice(0, clusters);
+  console.log(`Augment (${kind}): ${candidates.length} candidate solves in [${fmtSec(minMs)}..${fmtSec(maxMs)}]; processing ${sources.length} cluster(s) × up to ${nPerCluster} +1-${kind} neighbors (pool ${POOL_SIZE}).`);
+  const pool = new Pool(POOL_SIZE);
+  let generated = 0, skipped = 0;
+  const startedAt = performance.now();
+  for (const src of sources){
+    const open = [];
+    for (let i = 0; i < NCELLS; i++) if (src.state[i] === 0) open.push(i);
+    if (open.length === 0) continue;
+    for (let i = open.length - 1; i > 0; i--){
+      const j = (Math.random() * (i + 1)) | 0;
+      [open[i], open[j]] = [open[j], open[i]];
+    }
+    const cells = open.slice(0, nPerCluster);
+    const srcTag = `src#${src.i ?? '?'}(${fmtSec(src.finalMs)})`;
+    for (const cell of cells){
+      const newState = src.state.slice();
+      newState[cell] = cellValue;
+      const feats = fullPatch(featuresFor(newState, src.slots), newState, src.slots);
+      if (feats.infeasible){ skipped++; continue; }
+      if (feats.logProd > 55){ skipped++; continue; }
+      const board = { slots: src.slots, state: newState, features: feats };
+      const slotStr = src.slots.map(s => `${s.count}×${s.shape}`).join('+');
+      const t0 = performance.now();
+      const heartbeat = setInterval(() => {
+        const secs = ((performance.now() - t0) / 1000).toFixed(0);
+        console.log(`  ... aug-${kind} ${srcTag} cell=${cell} running for ${secs}s`);
+      }, 30_000);
+      let r;
+      try { r = await pool.solve(board); }
+      catch (e){ clearInterval(heartbeat); console.log('  aug solve failed:', e.message); continue; }
+      clearInterval(heartbeat);
+      if (r.finalMs < 30){ skipped++; continue; }
+      const rec = {
+        i: existing.length + generated + 1,
+        slots: board.slots,
+        state: board.state,
+        features: board.features,
+        finalMs: r.finalMs,
+        wallMs: r.wallMs,
+        workerMs: r.workerMs,
+        total: r.total,
+        leaves: r.leaves,
+        trajectory: r.trajectory,
+        augFrom: src.i ?? null,
+        augCell: cell,
+        augKind: kind,
+      };
+      fs.appendFileSync(RESULTS_PATH, JSON.stringify(rec) + '\n');
+      generated++;
+      console.log(`aug-${kind}+${String(generated).padStart(3)} ${srcTag} cell=${String(cell).padStart(2)} -> ${fmtSec(r.finalMs).padStart(8)}  ${slotStr}`);
+    }
+  }
+  pool.shutdown();
+  console.log(`\nAugment-${kind} done: ${generated} new boards (${skipped} skipped) in ${fmtSec(performance.now() - startedAt)}.\n`);
+}
+async function runAugment(){
+  return runAugmentImpl({ kind: 'miss', cellValue: 1, minMs: AUGMENT_MIN_MS, maxMs: Infinity, nPerCluster: AUGMENT_N, clusters: AUGMENT_CLUSTERS });
+}
+async function runHitAugment(){
+  return runAugmentImpl({ kind: 'hit', cellValue: 2, minMs: HIT_AUG_MIN_MS, maxMs: HIT_AUG_MAX_MS, nPerCluster: HIT_AUGMENT_N, clusters: HIT_AUGMENT_CLUSTERS });
+}
+
+// ----------------------------------------------------------------------------
 // Report generator (works from the JSONL file alone)
 // ----------------------------------------------------------------------------
 function loadResults(){
@@ -1349,7 +1777,7 @@ function loadResults(){
       const r = JSON.parse(line);
       // Recompute features at load time so adding features doesn't require re-running
       // the bench. The stored features become advisory.
-      r.features = patchFeatures(featuresFor(r.state, r.slots));
+      r.features = fullPatch(featuresFor(r.state, r.slots), r.state, r.slots);
       if (!r.features.infeasible) out.push(r);
     } catch (e) {}
   }
@@ -1475,12 +1903,58 @@ function reportLive(history, bestPrior, evalMinMs, lines){
   // and pollute the warp / variance estimates. Same fairness as the prior side.
   const CALIB_MIN_MS = 2000;
   const calibTrain = history.filter(h => h.finalMs >= CALIB_MIN_MS);
+  // Attach LOO-predicted priorMs to each calibration-eligible record so the
+  // bucketed warps key on prediction (symmetric with test-time bucket pick).
+  // Under --cluster-loo, the training set for each row excludes the row's
+  // entire cluster, not just the row itself.
+  if (bestPrior){
+    for (let i = 0; i < calibTrain.length; i++){
+      const r = calibTrain[i];
+      const train = CLUSTER_LOO
+        ? calibTrain.filter(x => clusterIdOf(x) !== clusterIdOf(r))
+        : calibTrain.slice(0, i).concat(calibTrain.slice(i+1));
+      if (train.length < 3) { r._looPriorMs = null; continue; }
+      const pred = bestPrior.build(train);
+      const yhat = pred ? pred(r) : null;
+      r._looPriorMs = (yhat && isFinite(yhat) && yhat > 0) ? yhat : null;
+    }
+  }
+  // Default (full-history) calibrations — used directly without --cluster-loo,
+  // and as fallback inside calibFor() when a cluster has too few siblings.
   const calibFnPick = buildCalibBuckets(calibTrain, ALPHA_CALIB);
   const calibFn = buildCalib(calibTrain);
+  // Parallel calibration trained on slowest-worker progress (minP, true_p).
+  // Powers `gatedLinMinCalOwn` (pooled) and `gatedLinMinBucket` (per-priorMs-bin).
+  const calibFnMin     = buildCalib(calibTrain, 0, null, pickMinPositive);
+  const calibFnMinPick = buildCalibBuckets(calibTrain, ALPHA_CALIB, pickMinPositive);
+  // Per-cluster calibration cache. Under --cluster-loo, calibFor(rec) returns
+  // warps built from calibTrain minus cluster(rec). Boards in single-element
+  // clusters (no augmented siblings) effectively get the standard LOO.
+  const calibCacheByCluster = new Map();
+  function calibFor(rec){
+    if (!CLUSTER_LOO) return { calibFn, calibFnBucketed: calibFnPick, calibFnMin, calibFnMinPick };
+    const cid = clusterIdOf(rec);
+    let hit = calibCacheByCluster.get(cid);
+    if (hit) return hit;
+    const sub = calibTrain.filter(r => clusterIdOf(r) !== cid);
+    hit = {
+      calibFn:         buildCalib(sub),
+      calibFnBucketed: buildCalibBuckets(sub, ALPHA_CALIB),
+      calibFnMin:      buildCalib(sub, 0, null, pickMinPositive),
+      calibFnMinPick:  buildCalibBuckets(sub, ALPHA_CALIB, pickMinPositive),
+    };
+    calibCacheByCluster.set(cid, hit);
+    return hit;
+  }
   const liveLogVar    = buildLiveLogVar2d(calibTrain, calibFnPick, false, ALPHA_VAR);
   const liveLogVarMin = buildLiveLogVar2d(calibTrain, calibFnPick, true,  ALPHA_VAR);
   const priorLogVar = bestPrior ? priorLogResidualVar(history, bestPrior.build, evalMinMs) : 0.06;
+  const priorResiduals = bestPrior ? buildPriorResidualSet(history, bestPrior.build, evalMinMs) : [];
+  const priorVarVariants = buildPriorVarVariants(priorResiduals, priorLogVar);
   lines.push(`σ²_prior = ${priorLogVar.toFixed(4)}  (log-residual variance of the prior model on LOO)`);
+  if (Object.keys(priorVarVariants).length){
+    lines.push(`local σ²_prior variants tested: ${Object.keys(priorVarVariants).join(', ')}`);
+  }
   lines.push(`Calibration/variance trained on ${calibTrain.length} solves with finalMs ≥ ${CALIB_MIN_MS}ms`);
   lines.push(`Bayesian shrinkage α: bias=${ALPHA_BIAS}, var=${ALPHA_VAR}, calib=${ALPHA_CALIB} (α=0 = legacy hard-cutoff fallbacks)`);
   lines.push('');
@@ -1494,14 +1968,20 @@ function reportLive(history, bestPrior, evalMinMs, lines){
     for (let i = 0; i < history.length; i++){
       const rec = history[i];
       if (rec.finalMs < evalMinMs) continue;
-      const train = history.slice(0, i).concat(history.slice(i+1));
+      const train = CLUSTER_LOO
+        ? history.filter(r => clusterIdOf(r) !== clusterIdOf(rec))
+        : history.slice(0, i).concat(history.slice(i+1));
       let priorMs = null;
       if (bestPrior){
         const pred = bestPrior.build(train);
         if (pred) priorMs = pred(rec);
       }
+      const cf = calibFor(rec);
       const replay = liveStratEtas(rec.trajectory, rec.finalMs, priorMs, {
-        calibFn, calibFnBucketed: calibFnPick, liveLogVar, liveLogVarMin, priorLogVar,
+        calibFn: cf.calibFn, calibFnBucketed: cf.calibFnBucketed,
+        calibFnMin: cf.calibFnMin, calibFnMinPick: cf.calibFnMinPick,
+        liveLogVar, liveLogVarMin, priorLogVar,
+        priorVarVariants,
         biasFor, biasFor2d,
       });
       for (const pt of replay){
@@ -1785,6 +2265,11 @@ function scoreChampSm80(trainSet, evalSet, opts){
   const calibTrain = trainSet.filter(h => h.finalMs >= 2000);
   const calibFnPick = buildCalibBuckets(calibTrain, aCal);
   const liveLogVar = buildLiveLogVar2d(calibTrain, calibFnPick, false, aVar);
+  // Bucketed warp on (minP, true_p) for the slow-worker handoff arm. Built
+  // only when requested so the default path stays as cheap as before.
+  const calibFnMinPick = opts.useBucketCalib
+    ? buildCalibBuckets(calibTrain, aCal, pickMinPositive)
+    : null;
 
   // In-sample priorLogVar (cheap; LOO would be more honest but cost-prohibitive in the inner loop).
   let pn = 0, ps = 0, ps2 = 0;
@@ -1868,11 +2353,26 @@ function scoreChampSm80(trainSet, evalSet, opts){
       const b = (pb >= 0 && tBin >= 0) ? bias2d[pb][tBin] : (pb >= 0 ? bias1[pb] : 0);
       const bayesBC = Math.max(0, Math.exp(mu - b) - e);
       let predR = bayesBC;
-      const minP = Math.min(...pt.pcts);
+      // Progress source for the slow-worker arm. `pct` = top-level branch
+      // completion fraction; `nps` = estimated node-completion fraction
+      // (nodes/(avg_branch_nodes*rangeLen)); `max(pct,nps)` per worker picks
+      // whichever signal is further along (pct is coarse early, nps is fine
+      // within the current branch).
+      const slowSrc = opts.slowSrc || 'pct';
+      let perWorker;
+      if (slowSrc === 'nps')        perWorker = pt.nps || pt.pcts;
+      else if (slowSrc === 'max')   perWorker = pt.pcts.map((p,i) => Math.max(p, (pt.nps && pt.nps[i]) || 0));
+      else                          perWorker = pt.pcts;
+      const minP = Math.min(...perWorker);
       const ctr = opts.center != null ? opts.center : 0.80;
       const wid = opts.width  != null ? opts.width  : 0.08;
       if (opts.noHandoff !== true && minP > 0){
-        const gated = e * (1 - minP) / minP;
+        // Slow-worker projection. With useBucketCalib, warp minP via the
+        // per-priorMs-bin (minP, true_p) calibration; otherwise raw lin(minP).
+        const minPforLin = calibFnMinPick
+          ? Math.max(0.001, Math.min(0.999, calibFnMinPick(priorMs)(minP)))
+          : minP;
+        const gated = e * (1 - minPforLin) / minPforLin;
         const w = 1 / (1 + Math.exp(-(predPhase - ctr) / wid));
         predR = (1 - w) * bayesBC + w * gated;
       }
@@ -1987,6 +2487,10 @@ function runFullSweep(){
     return scoreChampSm80(tr, evalSet,
       Object.assign({ aBias: alpha, aVar: alpha, aCalib: alpha }, opts || {}));
   }
+  function scoreAtBucket(tr, alpha, opts){
+    return scoreChampSm80(tr, evalSet,
+      Object.assign({ aBias: alpha, aVar: alpha, aCalib: alpha, useBucketCalib: true }, opts || {}));
+  }
 
   // PASS 1: full pool. Best sigmoid given alpha, best alpha given sigmoid.
   console.log('\n=== FULL POOL, sigmoid sweep at each alpha (overall absLog) ===');
@@ -2006,9 +2510,65 @@ function runFullSweep(){
       console.log('  c=' + ctr.toFixed(2) + '  ' + row.join('  ') + '    ' + nhStr);
     }
   }
-  console.log('\nFULL POOL best: alpha=' + bestFull.alpha
+  console.log('\nFULL POOL best (raw lin(minP)): alpha=' + bestFull.alpha
     + (bestFull.noHand ? '  no-handoff' : '  center=' + bestFull.ctr + '  width=' + bestFull.wid)
     + '  -> absLog ' + bestFull.score.toFixed(4));
+
+  // PASS 1b: same sweep but slow-worker arm uses the per-priorMs-bin (minP,true_p)
+  // calibration (`championBucket`). Compares apples-to-apples to PASS 1.
+  console.log('\n=== FULL POOL, BUCKET-CALIB handoff arm — sigmoid sweep (overall absLog) ===');
+  console.log('         ' + WIDTHS.map(w => ('w=' + w.toFixed(2)).padStart(8)).join('  ') + '    no-handoff');
+  let bestBucket = { score: Infinity, alpha: null, ctr: null, wid: null, noHand: false };
+  for (const alpha of ALPHAS){
+    console.log('--- alpha=' + alpha + ' ---');
+    for (const ctr of CENTERS){
+      const row = WIDTHS.map(wid => {
+        const r = scoreAtBucket(trainPool, alpha, { center: ctr, width: wid });
+        if (r && r.overall < bestBucket.score) bestBucket = { score: r.overall, worst: r.worst, alpha, ctr, wid, noHand: false };
+        return r ? r.overall.toFixed(4).padStart(8) : '    --  ';
+      });
+      const rNH = scoreAtBucket(trainPool, alpha, { noHandoff: true });
+      if (rNH && rNH.overall < bestBucket.score) bestBucket = { score: rNH.overall, worst: rNH.worst, alpha, ctr: null, wid: null, noHand: true };
+      const nhStr = rNH ? rNH.overall.toFixed(4) : '  --  ';
+      console.log('  c=' + ctr.toFixed(2) + '  ' + row.join('  ') + '    ' + nhStr);
+    }
+  }
+  console.log('\nFULL POOL best (bucket-calib lin(minP)): alpha=' + bestBucket.alpha
+    + (bestBucket.noHand ? '  no-handoff' : '  center=' + bestBucket.ctr + '  width=' + bestBucket.wid)
+    + '  -> absLog ' + bestBucket.score.toFixed(4)
+    + (bestBucket.worst != null ? '   worst-phase ' + bestBucket.worst.toFixed(4) : ''));
+  console.log('Δ vs raw-lin: ' + (bestBucket.score - bestFull.score).toFixed(4)
+    + '  (negative = bucket wins)');
+
+  // PASS 1c & 1d: same grid but slow-worker source is node-completion (nps)
+  // or per-worker max(pct, nps). Same raw lin formula on top.
+  function sweepSrc(label, srcName){
+    console.log('\n=== FULL POOL, slowSrc=' + srcName + ' — sigmoid sweep (overall absLog) ===');
+    console.log('         ' + WIDTHS.map(w => ('w=' + w.toFixed(2)).padStart(8)).join('  ') + '    no-handoff');
+    let best = { score: Infinity, alpha: null, ctr: null, wid: null, noHand: false };
+    for (const alpha of ALPHAS){
+      console.log('--- alpha=' + alpha + ' ---');
+      for (const ctr of CENTERS){
+        const row = WIDTHS.map(wid => {
+          const r = scoreAt(trainPool, alpha, { center: ctr, width: wid, slowSrc: srcName });
+          if (r && r.overall < best.score) best = { score: r.overall, worst: r.worst, alpha, ctr, wid, noHand: false };
+          return r ? r.overall.toFixed(4).padStart(8) : '    --  ';
+        });
+        const rNH = scoreAt(trainPool, alpha, { noHandoff: true, slowSrc: srcName });
+        if (rNH && rNH.overall < best.score) best = { score: rNH.overall, worst: rNH.worst, alpha, ctr: null, wid: null, noHand: true };
+        const nhStr = rNH ? rNH.overall.toFixed(4) : '  --  ';
+        console.log('  c=' + ctr.toFixed(2) + '  ' + row.join('  ') + '    ' + nhStr);
+      }
+    }
+    console.log('\nFULL POOL best (slowSrc=' + srcName + '): alpha=' + best.alpha
+      + (best.noHand ? '  no-handoff' : '  center=' + best.ctr + '  width=' + best.wid)
+      + '  -> absLog ' + best.score.toFixed(4)
+      + (best.worst != null ? '   worst-phase ' + best.worst.toFixed(4) : ''));
+    console.log('Δ vs raw-lin (pct): ' + (best.score - bestFull.score).toFixed(4));
+    return best;
+  }
+  const bestNps = sweepSrc('nps', 'nps');
+  const bestMax = sweepSrc('max', 'max');
 
   // PASS 2: subset sweep. For each subset size k, sweep (alpha, ctr, wid) and
   // also score the FULL-POOL champ on this subset, so we can see how much
@@ -2155,15 +2715,115 @@ function runFeatureAudit(){
     console.log('  ' + r.drop.padEnd(18) + sign + r.d.toFixed(4).padStart(8) + '   (drop→' + r.abs.toFixed(4) + ')');
   }
 
+  // -------------------------------------------------------------------------
+  // Within-cluster +1-miss sensitivity. For each feature, compute:
+  //   (a) global slope: OLS of log(finalMs) on the (standardized) feature
+  //   (b) within-cluster slope: mean of (Δ log finalMs)/(Δ feature) across
+  //       augmented clusters (src vs avg kid). This is the LOCAL +1-miss
+  //       derivative.
+  // Features where (a) and (b) agree explain the +1-miss effect honestly.
+  // Features where (b) >> (a) are confounded — they look weak globally
+  // because cross-board variation washes them out.
+  // -------------------------------------------------------------------------
+  const augs = history.filter(r => r.augFrom != null);
+  const bySrc = new Map();
+  for (const a of augs){
+    const src = history.find(r => r.i === a.augFrom);
+    if (!src) continue;
+    if (!bySrc.has(src.i)) bySrc.set(src.i, { src, kids: [] });
+    bySrc.get(src.i).kids.push(a);
+  }
+  const clusters = [...bySrc.values()].filter(c => c.kids.length >= 2);
+  if (clusters.length){
+    console.log('\n--- within-cluster +1-miss sensitivity (' + clusters.length + ' clusters) ---');
+    console.log('  global = OLS slope of log(finalMs) on standardized feature, ALL training boards');
+    console.log('  local  = mean over clusters of  Δlog(finalMs) / Δ(standardized feature)  for src→avg-kid');
+    console.log('  |local/global| > ~2 ⇒ feature CARRIES per-miss signal that population-level OLS misses\n');
+    const rowsLocal = [];
+    for (const k of FEATURE_KEYS){
+      const mean = means[FEATURE_KEYS.indexOf(k)], std = stds[FEATURE_KEYS.indexOf(k)];
+      if (!isFinite(std) || std < 1e-9) continue;
+      // global slope (univariate OLS on standardized feature)
+      let sxy = 0, sxx = 0;
+      for (const h of train){
+        const x = (h.features[k] - mean) / std;
+        const yy = Math.log(h.finalMs) - ybar;
+        sxy += x * yy; sxx += x * x;
+      }
+      const gSlope = sxx > 0 ? sxy / sxx : 0;
+      // within-cluster local slopes
+      const locals = [];
+      for (const { src, kids } of clusters){
+        const fSrc = (src.features[k] - mean) / std;
+        const fKidsAvg = kids.reduce((s, x) => s + (x.features[k] - mean) / std, 0) / kids.length;
+        const tKidsAvg = kids.reduce((s, x) => s + Math.log(x.finalMs), 0) / kids.length;
+        const dF = fKidsAvg - fSrc;
+        const dT = tKidsAvg - Math.log(src.finalMs);
+        if (Math.abs(dF) < 1e-6) continue;
+        locals.push(dT / dF);
+      }
+      if (!locals.length) continue;
+      locals.sort((a, b) => a - b);
+      const lMed = locals[locals.length >> 1];
+      const lMean = locals.reduce((a, b) => a + b, 0) / locals.length;
+      const ratio = Math.abs(gSlope) > 1e-6 ? lMean / gSlope : (lMean > 0 ? Infinity : -Infinity);
+      rowsLocal.push({ k, gSlope, lMean, lMed, ratio });
+    }
+    rowsLocal.sort((a, b) => Math.abs(b.ratio) - Math.abs(a.ratio));
+    console.log('  feature              global   local(mean)  local(median)   |local/global|');
+    for (const r of rowsLocal){
+      const tag = !isFinite(r.ratio) ? '  ∞' :
+                  Math.abs(r.ratio) > 3 ? '  ★★★ CONFOUNDED' :
+                  Math.abs(r.ratio) > 1.5 ? '  ★ under-counted' :
+                  Math.abs(r.ratio) < 0.3 ? '  weak local' : '';
+      console.log('  ' + r.k.padEnd(18) +
+        r.gSlope.toFixed(3).padStart(8) +
+        r.lMean.toFixed(3).padStart(13) +
+        r.lMed.toFixed(3).padStart(13) +
+        (isFinite(r.ratio) ? r.ratio.toFixed(2).padStart(13) : '          inf') +
+        tag);
+    }
+  } else {
+    console.log('\n(no augmented clusters in data — skip within-cluster sensitivity. Run --augment to generate.)');
+  }
+
   console.log('\n--- candidate compact feature sets (LOO absLog) ---');
+  // Sort by DROP-IMPORTANCE (positive Δ when removed), not ridge |coef|, since
+  // drop-importance is what actually measures contribution to LOO score.
+  const byDrop = rows.slice().filter(r => r.d > 0).sort((a, b) => b.d - a.d).map(r => r.drop);
   const sets = {
-    'lean3':  ['logChooseFree', 'logProd', 'density'],
-    'lean5':  ['logChooseFree', 'logProd', 'logSum', 'topShapeCount', 'density'],
-    'lean7':  ['logChooseFree', 'logProd', 'logSum', 'topShapeCount', 'density', 'effBranching', 'logFactSum'],
-    'top10':  ranked.slice(0, 10).map(r => r.k),
-    'top6':   ranked.slice(0, 6).map(r => r.k),
-    'top4':   ranked.slice(0, 4).map(r => r.k),
-    'just1':  ['logChooseFree'],
+    'just1':           ['logChooseFree'],
+    'top2_drop':       byDrop.slice(0, 2),
+    'top3_drop':       byDrop.slice(0, 3),
+    'top5_drop':       byDrop.slice(0, 5),
+    'top8_drop':       byDrop.slice(0, 8),
+    'top10_drop':      byDrop.slice(0, 10),
+    'top4_coef':       ranked.slice(0, 4).map(r => r.k),
+    'top6_coef':       ranked.slice(0, 6).map(r => r.k),
+    'top8_coef':       ranked.slice(0, 8).map(r => r.k),
+    'top10_coef':      ranked.slice(0, 10).map(r => r.k),
+    // Prior lean-8 (pre-interaction-terms baseline; kept for comparison)
+    'live_lean8':      ['logProdAdj', 'logProd', 'logSum', 'logFactSum', 'topShapeCount', 'density', 'logChooseFree', 'logProdRest'],
+    // Constraint-power features only — do they stand on their own?
+    'cellDrop_only':   ['maxCellDrop', 'medCellDrop', 'meanCellDrop', 'varCellDrop'],
+    'cellDrop_lean':   ['logChooseFree', 'maxCellDrop', 'medCellDrop', 'logProdAdj'],
+    // Lean-8 + one or two interaction terms (incremental probes)
+    'lean8_p3':        ['logProdAdj', 'logProd', 'logSum', 'logFactSum', 'topShapeCount', 'density', 'logChooseFree', 'logProdRest', 'logProd_per_open', 'logProd_x_nMiss'],
+    'lean8_miss_hit':  ['logProdAdj', 'logProd', 'logSum', 'logFactSum', 'topShapeCount', 'density', 'logChooseFree', 'logProdRest', 'logProd_x_nMiss', 'logProd_x_nHit'],
+    'lean8_lcf_inter': ['logProdAdj', 'logProd', 'logSum', 'logFactSum', 'topShapeCount', 'density', 'logChooseFree', 'logProdRest', 'logChooseFree_x_nMiss', 'logChooseFree_x_nHit'],
+    // Lean-8 + the full +1-miss/+1-hit interaction stack
+    'lean8_p3_hit':    ['logProdAdj', 'logProd', 'logSum', 'logFactSum', 'topShapeCount', 'density', 'logChooseFree', 'logProdRest', 'logProd_per_open', 'logProd_x_nMiss', 'logProd_x_nHit'],
+    // Aggressive response-surface stack — lean-8 + cross-product candidates
+    'lean8_rsm':       ['logProdAdj', 'logProd', 'logSum', 'logFactSum', 'topShapeCount', 'density', 'logChooseFree', 'logProdRest',
+                        'logProd_per_open', 'logProd_x_nMiss', 'logProd_x_nHit', 'logChooseFree_x_nMiss', 'logChooseFree_x_nHit', 'nMiss_plus_nHit'],
+    // fav4..fav10: successive subsets of lean8_p3_hit ordered by semantic role
+    // + measured drop-importance. fav10 is the shipped FEATURE_KEYS_LEAN — it
+    // drops algebraically-redundant raw logProd (= logProdAdj + logFactSum)
+    // and ties the 11-feature lean8_p3_hit at λ=0.001.
+    'fav4':  ['logChooseFree', 'logProdAdj', 'logProd_x_nMiss', 'logProd_x_nHit'],
+    'fav7':  ['logChooseFree', 'logProdAdj', 'logProd_x_nMiss', 'logProd_x_nHit', 'topShapeCount', 'density', 'logSum'],
+    'fav8':  ['logChooseFree', 'logProdAdj', 'logProd_x_nMiss', 'logProd_x_nHit', 'topShapeCount', 'density', 'logSum', 'logFactSum'],
+    'fav10': ['logChooseFree', 'logProdAdj', 'logProd_x_nMiss', 'logProd_x_nHit', 'topShapeCount', 'density', 'logSum', 'logFactSum', 'logProdRest', 'logProd_per_open'],
   };
   for (const [name, ks] of Object.entries(sets)){
     for (const lam of [0.001, 0.01, 0.1, 1.0]){
@@ -2192,6 +2852,16 @@ function runFeatureAudit(){
     return;
   }
   if (REPORT_ONLY){
+    generateReport();
+    return;
+  }
+  if (AUGMENT_MODE){
+    await runAugment();
+    generateReport();
+    return;
+  }
+  if (HIT_AUGMENT_MODE){
+    await runHitAugment();
     generateReport();
     return;
   }

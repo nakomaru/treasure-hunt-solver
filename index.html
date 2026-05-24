@@ -295,11 +295,12 @@ function logChoose(n, k){
   return s;
 }
 function featuresFor(stateArr, slotArr){
-  let missLo = 0, missHi = 0, nOpen = 0;
+  let missLo = 0, missHi = 0, nOpen = 0, nMiss = 0, nHit = 0;
   for (let i = 0; i < NCELLS; i++){
     const s = stateArr[i];
     const bL = i < 32 ? (1 << i) : 0, bH = i >= 32 ? (1 << (i-32)) : 0;
-    if (s === 1 || s === 3){ missLo |= bL; missHi |= bH; }
+    if (s === 1 || s === 3){ missLo |= bL; missHi |= bH; nMiss++; }
+    else if (s === 2) nHit++;
     else if (s === 0) nOpen++;
   }
   const grouped = {};
@@ -335,13 +336,22 @@ function featuresFor(stateArr, slotArr){
     logChooseFree: logChoose(nOpen, prizeArea),   // log C(open, total area) — single dominant predictor
     prizeArea,
     slack: nOpen - prizeArea,
+    // +1-miss/+1-hit interaction terms used by the fav10 prior. Cheap to
+    // compute; carry the per-marked-cell derivative that population OLS
+    // washes out across boards.
+    logProd_x_nMiss: logProd * nMiss,
+    logProd_x_nHit:  logProd * nHit,
+    logProd_per_open: nOpen > 0 ? logProd / nOpen : 0,
   };
 }
-// Top-10 by standardized ridge |coef| from bench-side feature audit; matches the
-// full 25-feature ridge LOO absLog to 3 decimals on the bench dataset.
+// fav10: lean core + three +1-miss/+1-hit interaction terms. Bench audit
+// shows LOO absLog 0.1361 at λ=0.001 vs 0.1723 for the bare 8-feature set
+// (−21%), and ties the 11-feature lean8_p3_hit while dropping raw logProd
+// — algebraically redundant since logProdAdj + logFactSum reconstructs it.
 const FEATURE_KEYS = [
-  "logProdAdj", "logProd", "logSum", "logFactSum", "topShapeCount",
-  "density", "logChooseFree", "prizeArea", "slack", "logProdRest",
+  "logChooseFree", "logProdAdj", "logProd_x_nMiss", "logProd_x_nHit",
+  "topShapeCount", "density", "logSum", "logFactSum",
+  "logProdRest", "logProd_per_open",
 ];
 
 // ---- board persistence (localStorage so a refresh/revisit keeps the board) ----
@@ -1093,8 +1103,13 @@ function predictFinalMs(features){
 // Precision-weighted log-blend of the prior and the calibrated-live total-time
 // estimates, 2D bias-corrected, with a smooth sigmoid handoff in the late phase
 // to a min-worker linear extrapolation (the slow-worker tail dominates there).
-const HANDOFF_CENTER = 0.75;
-const HANDOFF_WIDTH  = 0.08;
+// Picked from the full-pool (alpha × center × width) sweep on 412 solves.
+// (c=0.70, w=0.12, α=20) is the safe-across-n choice: matches the large-n
+// optimum and stays near-best on subsets of k≥50. center=0.70 is robust at
+// every k tested; width=0.12 is the middle ground (k=10 wants wider 0.30,
+// k=100 wants narrower 0.08).
+const HANDOFF_CENTER = 0.70;
+const HANDOFF_WIDTH  = 0.12;
 function predictEta(elapsed, pcts, priorMs){
   if (!priorMs || !isFinite(priorMs) || priorMs <= 0 || !pcts.length) return null;
   const avgP = pcts.reduce((a,b) => a+b, 0) / pcts.length;

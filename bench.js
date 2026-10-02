@@ -4,14 +4,15 @@
 //
 // 1. Correctness: DP arrangement counts vs a brute-force enumerator on random
 //    small boards with misses, hits and placed prizes.
-// 2. Speed: DP time on every empty-board shape triple with counts 0..6, and
-//    on random mid-game boards.
+// 2. Speed: DP time on every empty-board shape triple with counts 0 to
+//    MAX_COUNT. The games below also report DP time per move.
 // 3. Play quality: paired games on uniformly sampled hidden boards, the
 //    page's policy (optimal flip when the search finishes within SEARCH_MS,
 //    otherwise highest chance) against pure highest-chance play.
 //
 // Board mixes for the games: "low" draws 1-2 of each of three random shapes;
-// "high" draws 1-6 of each, rejecting mixes over 36 tiles of prize area.
+// "high" draws 1 to MAX_COUNT of each, rejecting mixes over 36 tiles of prize
+// area.
 // Writes bench-report.txt next to this file.
 'use strict';
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
@@ -22,6 +23,7 @@ const path = require('path');
 const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const engineSrc = html.match(/<script id="engine" type="text\/plain">([\s\S]*?)<\/script>/)[1];
 const SEARCH_MS = +html.match(/const SEARCH_MS = (\d+);/)[1];
+const MAX_COUNT = +html.match(/const MAX_COUNT = (\d+);/)[1];
 const engine = new Function(engineSrc + '\nreturn { W, H, NCELLS, orientations, buildPlacements, analyze, makeSearch };')();
 const { W, H, NCELLS, orientations, buildPlacements, analyze, makeSearch } = engine;
 
@@ -110,7 +112,7 @@ function speedEmptyBoards(){
   for (let a = 0; a < 7; a++) for (let b = a + 1; b < 7; b++) for (let c = b + 1; c < 7; c++){
     const shapes = [SHAPES[a], SHAPES[b], SHAPES[c]];
     const pls = buildPlacements(shapes);
-    for (let x = 0; x <= 6; x++) for (let y = 0; y <= 6; y++) for (let z = 0; z <= 6; z++){
+    for (let x = 0; x <= MAX_COUNT; x++) for (let y = 0; y <= MAX_COUNT; y++) for (let z = 0; z <= MAX_COUNT; z++){
       if (x + y + z === 0) continue;
       const t0 = performance.now();
       const r = analyze(pls, empty, [x, y, z]);
@@ -127,7 +129,7 @@ function speedEmptyBoards(){
 function randomGame(rnd, mix){
   for (;;){
     const shapes = pickShapes(rnd);
-    const counts = shapes.map(() => mix === 'low' ? 1 + Math.floor(rnd() * 2) : 1 + Math.floor(rnd() * 6));
+    const counts = shapes.map(() => mix === 'low' ? 1 + Math.floor(rnd() * 2) : 1 + Math.floor(rnd() * MAX_COUNT));
     if (mix === 'high' && shapes.reduce((s, sh, i) => s + AREA(sh) * counts[i], 0) > 36) continue;
     const pls = buildPlacements(shapes);
     const hidden = sampleArrangement(pls, new Int8Array(NCELLS), counts, rnd);
@@ -245,7 +247,7 @@ function localStamp(){
   const c = correctness(400);
   log(`${c.checked} random boards, ${c.bad} mismatches`);
 
-  log('\n== DP speed, empty boards (every shape triple, counts 0..6, feasible only) ==');
+  log(`\n== DP speed, empty boards (every shape triple, counts 0..${MAX_COUNT}, feasible only) ==`);
   const sp = speedEmptyBoards();
   log(`${sp.q.n} boards · p50 ${fmt(sp.q.p50)} ms · p95 ${fmt(sp.q.p95)} ms · p99 ${fmt(sp.q.p99)} ms · max ${fmt(sp.q.max)} ms`);
   log(`slowest: ${sp.worst.shapes.join(',')} x ${sp.worst.counts.join(',')} · ${sp.worst.total.toLocaleString('en-US')} arrangements`);

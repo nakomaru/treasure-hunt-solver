@@ -494,7 +494,7 @@ function makeSearch(pls){
 <script>
 const W = 9, H = 5, NCELLS = W * H;
 const SHAPES = ["1x2","1x3","1x4","2x2","2x3","2x4","3x3"];
-const MAX_COUNT = 6;
+const MAX_COUNT = 7;   // the DP packs each count into 3 bits
 
 // ---- state ----
 const state = new Int8Array(NCELLS); // 0 unknown, 1 miss, 2 hit, 3 placed prize

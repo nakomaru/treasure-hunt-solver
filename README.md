@@ -27,7 +27,7 @@ optimal tile and the status line shows the expected misses left.
 ## Using it
 
 1. **Set the prizes in play.** Each prize card takes a shape (tap to pick one)
-   and a count of 0–6. A clean load starts with a random mix and is saved to
+   and a count of 0–7. A clean load starts with a random mix and is saved to
    your browser's local storage from then on, so a refresh or revisit keeps
    the same board; **New random board** reseeds it at any time.
 2. The board lists the hit chance of each remaining tile. Reveal the ★ tile

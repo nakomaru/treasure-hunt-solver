@@ -13,23 +13,25 @@ Flipping a tile reveals empty space or the slice of prize artwork under it.
 
 ## How it works
 
-The solver enumerates every arrangement of the remaining prizes consistent
-with what you've revealed, then counts, for each unflipped tile, the fraction
-of arrangements where a prize covers it.
+The solver counts every arrangement of the remaining prizes consistent with
+what you've revealed, then shows, for each unflipped tile, the fraction of
+arrangements where a prize covers it. Counting runs as a dynamic program over
+the board column by column, so even opening boards with billions of
+arrangements solve in milliseconds.
 
-Slow boards show a live ETA. The prediction starts from a ridge-regression
-prior over board complexity and blends in the running progress signal as it
-becomes informative. Each completed solve is added to a small stratified
-history in local storage so the prediction sharpens with use.
+The ★ starts on the highest-chance tile. In the background the solver also
+searches for the flip that minimizes expected misses under optimal play; when
+the board is small enough for that search to finish, the ★ moves to the
+optimal tile and the status line shows the expected misses left.
 
 ## Using it
 
 1. **Set the prizes in play.** Each prize card takes a shape (tap to pick one)
-   and a count of 0–5. A clean load starts with a random mix and is saved to
+   and a count of 0–6. A clean load starts with a random mix and is saved to
    your browser's local storage from then on, so a refresh or revisit keeps
    the same board; **New random board** reseeds it at any time.
-2. The board lists the hit chance of each remaining tile. Reveal the highest
-   one in game.
+2. The board lists the hit chance of each remaining tile. Reveal the ★ tile
+   in game.
 3. If the tile was **empty**, mark it as **Miss ✕** with left click.
 4. If it was a **prize** → click or drag its shape from the prize card onto the
    board.
@@ -39,6 +41,11 @@ history in local storage so the prediction sharpens with use.
 ## Running locally
 
 Open `index.html` in a browser.
+
+`node bench.js [games]` checks the engine in `index.html` against a
+brute-force counter, times it, and plays paired simulated games to compare
+the page's policy with always flipping the highest-chance tile. Results go to
+`bench-report.txt`.
 
 ## License
 
